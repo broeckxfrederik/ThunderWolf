@@ -15,6 +15,7 @@ Greeting cog
 import asyncio
 import datetime
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import (
@@ -183,6 +184,47 @@ class Greeting(commands.Cog):
     @check_racer_channels.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
+
+    # ── test command ──────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="test-welcome",
+        description="Send the welcome DM to a user as a test (CEO / Team Manager only).",
+    )
+    @app_commands.describe(user="The member to send the welcome message to")
+    @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
+    async def test_welcome(self, interaction: discord.Interaction, user: discord.Member):
+        view = JoinView(user)
+
+        try:
+            await user.send(
+                f"👋 Welcome to **{interaction.guild.name}**, {user.mention}!\n\n"
+                "What brings you here? Pick your role below:",
+                view=view,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Could not DM {user.mention} — they have DMs disabled.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Welcome message sent to {user.mention}.", ephemeral=True
+        )
+
+        await view.wait()
+
+        if getattr(view, "chosen", None) == "racer":
+            await self._create_racer_channel(user)
+
+    @test_welcome.error
+    async def test_welcome_error(self, interaction: discord.Interaction, error):
+        if isinstance(error, app_commands.MissingAnyRole):
+            await interaction.response.send_message(
+                "❌ Only CEO or Team Manager can use this command.", ephemeral=True
+            )
+        else:
+            raise error
 
 
 async def setup(bot: commands.Bot):
