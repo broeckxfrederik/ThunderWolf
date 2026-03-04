@@ -2,11 +2,12 @@
 Greeting cog
 ────────────
 • Listens for new members joining the guild.
-• DMs them with three buttons: Racer / Just Visiting / Updates Only.
-• Assigns the chosen role on the guild.
+• Creates a temporary private channel  #welcome-<username>  visible only to
+  the new member, then posts role-picker buttons there.
+• After the member picks a role the channel is automatically deleted.
 • If Racer is chosen:
-    - Creates a private channel  #racer-<username>
-      visible only to the member, CEO and Team Manager.
+    - Creates a permanent private channel  #racer-<username>
+      visible to the member, CEO and Team Manager.
     - Posts onboarding instructions that tag Team Manager.
     - A background task checks every hour; if Team Manager has not
       posted in that channel after RACER_REMINDER_DAYS days it tags CEO too.
@@ -30,11 +31,12 @@ _pending_racer_channels: dict[int, datetime.datetime] = {}
 
 
 class JoinView(discord.ui.View):
-    """Buttons sent to a new member in their DM."""
+    """Buttons posted in the temporary welcome channel."""
 
     def __init__(self, member: discord.Member):
         super().__init__(timeout=600)  # 10 minutes to respond
         self.member = member
+        self.chosen: str | None = None
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -43,11 +45,11 @@ class JoinView(discord.ui.View):
         if role:
             await self.member.add_roles(role)
 
-    async def _disable(self, interaction: discord.Interaction, label: str):
+    async def _confirm_and_close(self, interaction: discord.Interaction, label: str):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ You've been registered as **{label}**. Welcome!",
+            content=f"✅ Got it! You've been registered as **{label}**.\nThis channel will be removed in a few seconds.",
             view=self,
         )
         self.stop()
@@ -57,20 +59,19 @@ class JoinView(discord.ui.View):
     @discord.ui.button(label="🏎️ Racer", style=discord.ButtonStyle.primary)
     async def btn_racer(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._assign(interaction, ROLE_RACER)
-        await self._disable(interaction, "Racer")
-        # Hand off to the cog so we can access the bot
+        await self._confirm_and_close(interaction, "Racer")
         self.chosen = "racer"
 
     @discord.ui.button(label="👀 Just Visiting", style=discord.ButtonStyle.secondary)
     async def btn_visitor(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._assign(interaction, ROLE_VISITOR)
-        await self._disable(interaction, "Visitor")
+        await self._confirm_and_close(interaction, "Visitor")
         self.chosen = "visitor"
 
     @discord.ui.button(label="📢 Updates Only", style=discord.ButtonStyle.secondary)
     async def btn_updates(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._assign(interaction, ROLE_UPDATES)
-        await self._disable(interaction, "Updates Only")
+        await self._confirm_and_close(interaction, "Updates Only")
         self.chosen = "updates"
 
 
@@ -86,21 +87,37 @@ class Greeting(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        await self._run_welcome(member)
+
+    async def _run_welcome(self, member: discord.Member):
+        guild = member.guild
+
+        # Create a temporary private channel only the member can see
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member:             discord.PermissionOverwrite(view_channel=True, send_messages=False),
+        }
+        welcome_ch = await guild.create_text_channel(
+            name=f"welcome-{member.name}",
+            overwrites=overwrites,
+            reason="Member welcome channel",
+        )
+
         view = JoinView(member)
+        await welcome_ch.send(
+            f"👋 Hey {member.mention}, welcome to **{guild.name}**!\n\n"
+            "What brings you here? Pick your role below:",
+            view=view,
+        )
 
-        try:
-            msg = await member.send(
-                f"👋 Welcome to **{member.guild.name}**, {member.mention}!\n\n"
-                "What brings you here? Pick your role below:",
-                view=view,
-            )
-        except discord.Forbidden:
-            return  # user has DMs disabled – nothing we can do
-
-        # Wait for the view to finish so we know what was chosen
+        # Wait for the member to pick (or time out)
         await view.wait()
 
-        if getattr(view, "chosen", None) == "racer":
+        # Brief pause so they can read the confirmation message
+        await asyncio.sleep(5)
+        await welcome_ch.delete(reason="Welcome flow complete")
+
+        if view.chosen == "racer":
             await self._create_racer_channel(member)
 
     # ── racer channel creation ────────────────────────────────────────────────
@@ -189,33 +206,15 @@ class Greeting(commands.Cog):
 
     @app_commands.command(
         name="test-welcome",
-        description="Send the welcome DM to a user as a test (CEO / Team Manager only).",
+        description="Trigger the welcome channel flow for a user (CEO / Team Manager only).",
     )
     @app_commands.describe(user="The member to send the welcome message to")
     @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
     async def test_welcome(self, interaction: discord.Interaction, user: discord.Member):
-        view = JoinView(user)
-
-        try:
-            await user.send(
-                f"👋 Welcome to **{interaction.guild.name}**, {user.mention}!\n\n"
-                "What brings you here? Pick your role below:",
-                view=view,
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                f"❌ Could not DM {user.mention} — they have DMs disabled.", ephemeral=True
-            )
-            return
-
         await interaction.response.send_message(
-            f"✅ Welcome message sent to {user.mention}.", ephemeral=True
+            f"✅ Creating welcome channel for {user.mention}…", ephemeral=True
         )
-
-        await view.wait()
-
-        if getattr(view, "chosen", None) == "racer":
-            await self._create_racer_channel(user)
+        await self._run_welcome(user)
 
     @test_welcome.error
     async def test_welcome_error(self, interaction: discord.Interaction, error):
