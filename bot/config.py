@@ -41,3 +41,11 @@ RACER_ONBOARDING_MSG = (
     "When you're done, send a message here and tag {team_manager_mention} "
     "so they can complete your registration. ✅"
 )
+
+# ── Welcome channel settings ───────────────────────────────────────────────────
+# Category name for temporary welcome channels (visible to owner + CEO only)
+WELCOME_CATEGORY      = "New Members"
+# Days after join before the bot sends a reminder in the welcome channel
+WELCOME_REMINDER_DAYS = 2
+# Days after join before the bot kicks the member and deletes the channel
+WELCOME_KICK_DAYS     = 7
