@@ -15,6 +15,7 @@ TOKEN    = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
 COGS = [
+    "cogs.setup",
     "cogs.greeting",
     "cogs.reaction_roles",
     "cogs.race_event",

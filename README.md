@@ -51,23 +51,33 @@ Discord bot for managing a racing team — member onboarding, race event lineups
 
 ---
 
-## 4. Create the Required Roles
+## 4. Create the Required Roles & Channels
 
-Create these roles in your Discord server (**Server Settings → Roles**). The names must match exactly:
+Once the bot is online, run the following command in any channel **as the server owner**:
 
-| Role name | Purpose |
+```
+/setup
+```
+
+This automatically creates every role and channel the bot needs:
+
+| What | Name |
 |---|---|
-| `CEO` | Full admin access to all bot commands |
-| `Team-Manager` | Can run `/event`, `/test-welcome`, `/post-roles` |
-| `Racer` | Assigned to members who join as a racer |
-| `Visitor` | Assigned to members who are just visiting |
-| `Updates-Only` | Assigned to members who only want updates |
-| `Livery-Prodigy` | Opt-in via reaction roles |
-| `F1-Updates` | Opt-in via reaction roles |
-| `Twitch-Notifications` | Opt-in via reaction roles |
-| `Driver-Notification` | Opt-in via reaction roles |
+| Role | `CEO` |
+| Role | `Team-Manager` |
+| Role | `Racer` |
+| Role | `Visitor` |
+| Role | `Updates-Only` |
+| Role | `Livery-Prodigy` |
+| Role | `F1-Updates` |
+| Role | `Twitch-Notifications` |
+| Role | `Driver-Notification` |
+| Category | `New Members` (owner + CEO only) |
+| Channel | `#team-manager-lineups` (CEO + Team-Manager only) |
 
-> The bot role must be placed **above** all the roles it needs to assign in the role hierarchy.
+The command is idempotent — running it again skips anything that already exists.
+
+> After `/setup` completes, go to **Server Settings → Roles** and drag the bot's role **above** all the roles listed above so it can assign them to members.
 
 ---
 
@@ -122,19 +132,24 @@ python bot.py
 
 ## 8. First-time Setup in Discord
 
-Once the bot is online, run these commands in your server:
+Once the bot is online, run these commands **in order** as the server owner:
 
-1. **Post the reaction-role selector** in any channel:
+1. **Create all roles and channels** (owner only):
+   ```
+   /setup
+   ```
+
+2. **Drag the bot's role** above all created roles in **Server Settings → Roles**.
+
+3. **Post the reaction-role selector** in your public roles channel:
    ```
    /post-roles
    ```
 
-2. **Test the welcome flow** with yourself or another member:
+4. **Test the welcome flow** with yourself or another member:
    ```
    /test-welcome user:@SomeMember
    ```
-
-The **"New Members"** category will be created automatically on first join. It is only visible to the guild owner and the `CEO` role.
 
 ---
 
@@ -156,6 +171,7 @@ All tunable values are in `bot/config.py`:
 
 | Command | Who can use it | Description |
 |---|---|---|
+| `/setup` | Server owner | Create all required roles and channels (idempotent) |
 | `/event cars:Ferrari,Mercedes` | CEO, Team Manager | Start a race event with car-selection buttons |
 | `/post-roles` | CEO, Team Manager | Post the opt-in reaction-role message |
 | `/test-welcome user:@Member` | CEO, Team Manager | Trigger the welcome channel flow for a member |
