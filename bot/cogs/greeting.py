@@ -131,6 +131,7 @@ class Greeting(commands.Cog):
         ceo_role = discord.utils.get(guild.roles, name=ROLE_CEO)
         overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True),
         }
         if guild.owner:
             overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
