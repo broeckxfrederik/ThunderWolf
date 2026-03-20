@@ -313,10 +313,21 @@ class Greeting(commands.Cog):
     @app_commands.describe(user="The member to send the welcome message to")
     @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
     async def test_welcome(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.send_message(
-            f"✅ Creating welcome channel for {user.mention}…", ephemeral=True
-        )
-        await self._run_welcome(user)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self._run_welcome(user)
+            await interaction.followup.send(
+                f"✅ Welcome channel created for {user.mention}.", ephemeral=True
+            )
+        except discord.Forbidden as e:
+            await interaction.followup.send(
+                f"❌ Missing permission: `{e.text}`\n"
+                "Make sure the bot has **Manage Channels** in the server.", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Unexpected error: `{type(e).__name__}: {e}`", ephemeral=True
+            )
 
     @test_welcome.error
     async def test_welcome_error(self, interaction: discord.Interaction, error):
