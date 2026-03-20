@@ -25,9 +25,8 @@ COGS = [
 class ThunderWolf(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members        = True   # needed for on_member_join
-        intents.message_content = True  # needed for reading messages
-        intents.reactions      = True   # needed for reaction roles
+        intents.members   = True  # privileged — enable in Developer Portal → Bot → Privileged Gateway Intents
+        intents.reactions = True  # needed for reaction roles
 
         super().__init__(command_prefix="!", intents=intents)
 
