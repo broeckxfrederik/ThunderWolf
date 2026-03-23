@@ -1,57 +1,198 @@
 """
 Setup cog
 ─────────
-• /setup  — one-time server setup command (guild owner only).
+/setup        — step-through wizard (CEO only) to link existing roles and
+                channels to the bot config, or create them if absent.
+/setup-status — show current linked items with ✅ / ❌ per item.
 
-  What it creates (skips anything that already exists):
-
-  Roles
-  ─────
-  CEO, Team-Manager, Racer, Visitor, Updates-Only,
-  Livery-Prodigy, F1-Updates, Twitch-Notifications, Driver-Notification
-
-  Channels / Categories
-  ─────────────────────
-  • "New Members" category   — visible to owner + CEO only
-  • #team-manager-lineups    — visible to CEO + Team-Manager only
-
-  After running, the bot reports exactly what was created vs already present.
+All selections are persisted to the SQLite guild_config table so they
+survive bot restarts and redeployments.
 """
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+import db
 from config import (
+    ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
-    ROLE_RACER, ROLE_VISITOR, ROLE_UPDATES,
-    ROLE_LIVERY, ROLE_F1, ROLE_TWITCH, ROLE_DRIVER,
-    WELCOME_CATEGORY, CHANNEL_LINEUP,
+    WELCOME_CATEGORY, RACES_CATEGORY,
+    CHANNEL_ROLE_REQUESTS, CHANNEL_CAR_SETUPS, CHANNEL_LINEUP,
+    CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
+    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
+    CFG_CAT_WELCOME, CFG_CAT_RACES,
+    CFG_CH_ROLE_REQ, CFG_CH_CAR_SETUPS, CFG_CH_LINEUP,
 )
 
-# Ordered so that higher-authority roles are created first (Discord shows
-# newly-created roles below the bot's own role, so order here is cosmetic).
-ALL_ROLES = [
-    ROLE_CEO,
-    ROLE_TEAM_MANAGER,
-    ROLE_RACER,
-    ROLE_VISITOR,
-    ROLE_UPDATES,
-    ROLE_LIVERY,
-    ROLE_F1,
-    ROLE_TWITCH,
-    ROLE_DRIVER,
+
+# ── wizard step definitions ────────────────────────────────────────────────────
+
+# (config_key, label, kind, default_name)
+# kind: "role" | "category" | "text_channel" | "forum"
+STEPS: list[tuple[str, str, str, str]] = [
+    (CFG_ROLE_DRIVER,    "Driver role",                "role",         ROLE_DRIVER),
+    (CFG_ROLE_ENGINEER,  "Engineer role",               "role",         ROLE_ENGINEER),
+    (CFG_ROLE_LIVERY,    "Livery Designer role",        "role",         ROLE_LIVERY),
+    (CFG_ROLE_VISITOR,   "Visitor role",                "role",         ROLE_VISITOR),
+    (CFG_ROLE_UPDATES,   "Updates-Only role",           "role",         ROLE_UPDATES),
+    (CFG_ROLE_CEO,       "CEO role",                    "role",         ROLE_CEO),
+    (CFG_ROLE_TM,        "Team Manager role",           "role",         ROLE_TEAM_MANAGER),
+    (CFG_CAT_WELCOME,    "Welcome category",            "category",     WELCOME_CATEGORY),
+    (CFG_CAT_RACES,      "Races category",              "category",     RACES_CATEGORY),
+    (CFG_CH_ROLE_REQ,    "Role-requests channel",       "text_channel", CHANNEL_ROLE_REQUESTS),
+    (CFG_CH_CAR_SETUPS,  "Car-setups forum channel",    "forum",        CHANNEL_CAR_SETUPS),
+    (CFG_CH_LINEUP,      "Team-manager lineups channel","text_channel", CHANNEL_LINEUP),
 ]
 
 
-def _is_owner():
-    """App-command check: only the guild owner may run /setup."""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            return False
-        return interaction.user.id == interaction.guild.owner_id
-    return app_commands.check(predicate)
+# ── wizard view ───────────────────────────────────────────────────────────────
 
+class SetupView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, step: int = 0):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.step  = step
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        key, label, kind, default_name = STEPS[self.step]
+        total = len(STEPS)
+
+        if kind == "role":
+            sel = discord.ui.RoleSelect(
+                placeholder=f"({self.step+1}/{total}) Pick: {label}",
+                min_values=1, max_values=1,
+            )
+        elif kind == "category":
+            sel = discord.ui.ChannelSelect(
+                placeholder=f"({self.step+1}/{total}) Pick: {label}",
+                min_values=1, max_values=1,
+                channel_types=[discord.ChannelType.category],
+            )
+        elif kind == "forum":
+            sel = discord.ui.ChannelSelect(
+                placeholder=f"({self.step+1}/{total}) Pick: {label}",
+                min_values=1, max_values=1,
+                channel_types=[discord.ChannelType.forum],
+            )
+        else:  # text_channel
+            sel = discord.ui.ChannelSelect(
+                placeholder=f"({self.step+1}/{total}) Pick: {label}",
+                min_values=1, max_values=1,
+                channel_types=[discord.ChannelType.text],
+            )
+
+        # Capture references for the closures
+        view      = self
+        cfg_key   = key
+        def_name  = default_name
+        step_kind = kind
+
+        async def on_select(interaction: discord.Interaction):
+            selected_id = str(sel.values[0].id)
+            db.set_config(view.guild.id, cfg_key, selected_id)
+            await view._advance(interaction)
+
+        async def on_create(interaction: discord.Interaction):
+            created_id = await _create_resource(view.guild, step_kind, def_name)
+            if created_id:
+                db.set_config(view.guild.id, cfg_key, str(created_id))
+            await view._advance(interaction)
+
+        async def on_skip(interaction: discord.Interaction):
+            await view._advance(interaction)
+
+        sel.callback = on_select
+        self.add_item(sel)
+
+        create_btn = discord.ui.Button(
+            label=f'Create "{default_name}"',
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        create_btn.callback = on_create
+        self.add_item(create_btn)
+
+        skip_btn = discord.ui.Button(
+            label="Skip",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        skip_btn.callback = on_skip
+        self.add_item(skip_btn)
+
+    async def _advance(self, interaction: discord.Interaction):
+        self.step += 1
+        if self.step >= len(STEPS):
+            await interaction.response.edit_message(
+                content="✅ **Setup complete!** Use `/setup-status` to review all mappings.",
+                view=None,
+            )
+            self.stop()
+        else:
+            self._build()
+            await interaction.response.edit_message(
+                content=_step_prompt(self.step),
+                view=self,
+            )
+
+
+def _step_prompt(step: int) -> str:
+    key, label, kind, default = STEPS[step]
+    total = len(STEPS)
+    kind_hint = {
+        "role":         "a server role",
+        "category":     "a channel category",
+        "text_channel": "a text channel",
+        "forum":        "a Forum channel",
+    }[kind]
+    return (
+        f"**Setup — Step {step+1}/{total}**\n"
+        f"Select {kind_hint} to use for **{label}**, "
+        f'or click **Create "{default}"** to make a new one, '
+        f"or **Skip** to configure later."
+    )
+
+
+async def _create_resource(guild: discord.Guild, kind: str, name: str) -> int | None:
+    try:
+        if kind == "role":
+            obj = await guild.create_role(name=name, reason="ThunderWolf /setup")
+        elif kind == "category":
+            obj = await guild.create_category(name=name, reason="ThunderWolf /setup")
+        elif kind == "forum":
+            obj = await guild.create_forum(name=name, reason="ThunderWolf /setup")
+        else:
+            obj = await guild.create_text_channel(name=name, reason="ThunderWolf /setup")
+        return obj.id
+    except discord.Forbidden:
+        return None
+
+
+# ── setup-status helpers ──────────────────────────────────────────────────────
+
+def _status_lines(guild: discord.Guild, cfg: dict[str, str]) -> str:
+    lines = ["**ThunderWolf Setup Status**\n"]
+    for key, label, kind, _ in STEPS:
+        raw_id = cfg.get(key)
+        if not raw_id:
+            lines.append(f"❌  {label}")
+            continue
+        obj = None
+        if kind == "role":
+            obj = guild.get_role(int(raw_id))
+        else:
+            obj = guild.get_channel(int(raw_id))
+        if obj:
+            lines.append(f"✅  {label} → **{obj.name}**")
+        else:
+            lines.append(f"⚠️  {label} → *(id {raw_id} not found)*")
+    return "\n".join(lines)
+
+
+# ── cog ───────────────────────────────────────────────────────────────────────
 
 class Setup(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -59,88 +200,41 @@ class Setup(commands.Cog):
 
     @app_commands.command(
         name="setup",
-        description="One-time server setup: creates all required roles and channels (owner only).",
+        description="(CEO only) Configure roles and channels for ThunderWolf.",
     )
-    @_is_owner()
+    @app_commands.checks.has_any_role(ROLE_CEO)
     async def setup(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        guild = interaction.guild
-        created: list[str] = []
-        skipped: list[str] = []
-
-        # ── 1. Roles ──────────────────────────────────────────────────────────
-        for role_name in ALL_ROLES:
-            if discord.utils.get(guild.roles, name=role_name):
-                skipped.append(f"role `{role_name}`")
-            else:
-                await guild.create_role(name=role_name, reason="/setup command")
-                created.append(f"role `{role_name}`")
-
-        # Fetch fresh role objects after creation
-        ceo_role = discord.utils.get(guild.roles, name=ROLE_CEO)
-        tm_role  = discord.utils.get(guild.roles, name=ROLE_TEAM_MANAGER)
-
-        # ── 2. "New Members" category ─────────────────────────────────────────
-        if discord.utils.get(guild.categories, name=WELCOME_CATEGORY):
-            skipped.append(f"category `{WELCOME_CATEGORY}`")
-        else:
-            overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            }
-            if guild.owner:
-                overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
-            if ceo_role:
-                overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
-
-            await guild.create_category(
-                name=WELCOME_CATEGORY,
-                overwrites=overwrites,
-                reason="/setup command",
-            )
-            created.append(f"category `{WELCOME_CATEGORY}`")
-
-        # ── 3. #team-manager-lineups ──────────────────────────────────────────
-        if discord.utils.get(guild.text_channels, name=CHANNEL_LINEUP):
-            skipped.append(f"channel `#{CHANNEL_LINEUP}`")
-        else:
-            ch_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            }
-            if ceo_role:
-                ch_overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-            if tm_role:
-                ch_overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-            await guild.create_text_channel(
-                name=CHANNEL_LINEUP,
-                overwrites=ch_overwrites,
-                reason="/setup command",
-            )
-            created.append(f"channel `#{CHANNEL_LINEUP}`")
-
-        # ── 4. Reply ──────────────────────────────────────────────────────────
-        lines: list[str] = ["## ✅ ThunderWolf Setup Complete\n"]
-
-        if created:
-            lines.append("**Created:**")
-            lines.extend(f"  • {item}" for item in created)
-        if skipped:
-            lines.append("\n**Already existed (skipped):**")
-            lines.extend(f"  • {item}" for item in skipped)
-
-        lines.append(
-            "\n> Make sure the bot's role sits **above** all the roles listed above "
-            "in Server Settings → Roles so it can assign them."
+        view = SetupView(interaction.guild, step=0)
+        await interaction.response.send_message(
+            _step_prompt(0),
+            view=view,
+            ephemeral=True,
         )
 
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    @app_commands.command(
+        name="setup-status",
+        description="Show current ThunderWolf configuration (CEO / Team Manager only).",
+    )
+    @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
+    async def setup_status(self, interaction: discord.Interaction):
+        cfg = db.get_all_config(interaction.guild_id)
+        text = _status_lines(interaction.guild, cfg)
+        await interaction.response.send_message(text, ephemeral=True)
 
     @setup.error
     async def setup_error(self, interaction: discord.Interaction, error):
-        if isinstance(error, app_commands.CheckFailure):
+        if isinstance(error, app_commands.MissingAnyRole):
             await interaction.response.send_message(
-                "❌ Only the server owner can run `/setup`.", ephemeral=True
+                "❌ Only the CEO can run `/setup`.", ephemeral=True
+            )
+        else:
+            raise error
+
+    @setup_status.error
+    async def setup_status_error(self, interaction: discord.Interaction, error):
+        if isinstance(error, app_commands.MissingAnyRole):
+            await interaction.response.send_message(
+                "❌ Only CEO or Team Manager can view setup status.", ephemeral=True
             )
         else:
             raise error
