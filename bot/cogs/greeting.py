@@ -25,7 +25,7 @@ from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
-    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES,
+    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CAT_WELCOME, WELCOME_CATEGORY,
     WELCOME_TIMEOUT_HOURS,
 )
@@ -53,8 +53,8 @@ async def _get_or_create_welcome_category(guild: discord.Guild) -> discord.Categ
     if cat:
         return cat
 
-    ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
-    tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+    ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+    tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me:           discord.PermissionOverwrite(
@@ -161,8 +161,8 @@ class Greeting(commands.Cog):
         guild    = member.guild
         category = await _get_or_create_welcome_category(guild)
 
-        ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
-        tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+        ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+        tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
 
         overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),

@@ -21,7 +21,7 @@ from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
-    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES,
+    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CH_ROLE_REQ, CHANNEL_ROLE_REQUESTS,
 )
 
@@ -76,8 +76,8 @@ async def _get_role_requests_channel(guild: discord.Guild) -> discord.TextChanne
         return ch
 
     # Create it — visible to CEO and TM only
-    ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
-    tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+    ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+    tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
@@ -168,8 +168,8 @@ class RequestCardView(discord.ui.View):
 
     async def _check_authority(self, interaction: discord.Interaction) -> bool:
         guild    = interaction.guild
-        ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
-        tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+        ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+        tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
         user     = interaction.user
         has_auth = (
             (ceo_role and ceo_role in user.roles) or
