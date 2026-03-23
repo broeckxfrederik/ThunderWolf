@@ -247,11 +247,14 @@ def mark_roles_cleaned(event_id: int) -> None:
 
 
 def get_events_due_cleanup(before_iso: str) -> list[dict]:
-    """Return events whose results were posted before before_iso and haven't been cleaned yet."""
+    """Return events whose race date is before before_iso and haven't been cleaned yet.
+
+    Cleanup triggers 48h after the race date regardless of whether results
+    were posted — the race has happened either way.
+    """
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM events WHERE results_at IS NOT NULL "
-            "AND results_at <= ? AND roles_cleaned=0",
+            "SELECT * FROM events WHERE date_utc <= ? AND roles_cleaned=0",
             (before_iso,),
         ).fetchall()
     out = []
