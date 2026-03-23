@@ -9,6 +9,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import db
+
 load_dotenv()
 
 TOKEN    = os.environ["DISCORD_TOKEN"]
@@ -16,21 +18,27 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 
 COGS = [
     "cogs.setup",
+    "cogs.cars",
     "cogs.greeting",
     "cogs.reaction_roles",
     "cogs.race_event",
+    "cogs.roles",
 ]
 
 
 class ThunderWolf(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members   = True  # privileged — enable in Developer Portal → Bot → Privileged Gateway Intents
-        intents.reactions = True  # needed for reaction roles
-
+        intents.members         = True   # needed for on_member_join
+        intents.message_content = True   # needed for reading messages
+        intents.reactions       = True   # needed for reaction roles
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        # Initialise the database first — everything else depends on it
+        db.init_db()
+        print("  ✓ database ready")
+
         for cog in COGS:
             await self.load_extension(cog)
             print(f"  ✓ loaded {cog}")

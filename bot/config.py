@@ -1,51 +1,54 @@
-# ── Membership roles ──────────────────────────────────────────────────────────
-ROLE_RACER        = "Racer"
+# ── Team / membership roles ───────────────────────────────────────────────────
+# These are the default names used when creating new roles.
+# Existing roles are linked via /setup (IDs stored in DB).
+ROLE_DRIVER       = "Driver"
+ROLE_ENGINEER     = "Engineer"
+ROLE_LIVERY       = "Livery-Designer"
 ROLE_VISITOR      = "Visitor"
 ROLE_UPDATES      = "Updates-Only"
-
-# ── Reaction / opt-in roles ───────────────────────────────────────────────────
-ROLE_LIVERY       = "Livery-Prodigy"
-ROLE_F1           = "F1-Updates"
-ROLE_TWITCH       = "Twitch-Notifications"
-ROLE_DRIVER       = "Driver-Notification"
 
 # ── Admin roles ───────────────────────────────────────────────────────────────
 ROLE_CEO          = "CEO"
 ROLE_TEAM_MANAGER = "Team-Manager"
 
-# ── Channels ──────────────────────────────────────────────────────────────────
-CHANNEL_LINEUP    = "team-manager-lineups"   # private channel for race lineups
-
-# ── Temp race role prefix ─────────────────────────────────────────────────────
-# Temp roles are named  Race-<car>  and wiped at the start of each /event
-RACE_ROLE_PREFIX  = "Race-"
+# ── Reaction / opt-in roles ───────────────────────────────────────────────────
+ROLE_F1           = "F1-Updates"
+ROLE_TWITCH       = "Twitch-Notifications"
+ROLE_DRIVER_NOTIF = "Driver-Notification"
 
 # ── Reaction-role emoji map  (emoji → role name) ──────────────────────────────
 REACTION_ROLES = {
-    "🎨": ROLE_LIVERY,
     "📡": ROLE_F1,
     "📺": ROLE_TWITCH,
-    "🏁": ROLE_DRIVER,
+    "🏁": ROLE_DRIVER_NOTIF,
 }
 
-# ── Racer onboarding ──────────────────────────────────────────────────────────
-# How many days before the bot pings @CEO if Team Manager hasn't responded
-RACER_REMINDER_DAYS = 2
+# ── Temp race role prefix ─────────────────────────────────────────────────────
+RACE_ROLE_PREFIX = "Race-"
 
-RACER_ONBOARDING_MSG = (
-    "👋 Welcome to the team, {mention}!\n\n"
-    "To get you set up as a racer, please:\n"
-    "1. Add the following friend codes: **[add your friend codes here]**\n"
-    "2. Share your in-game username\n"
-    "3. Tell us your preferred racing style / availability\n\n"
-    "When you're done, send a message here and tag {team_manager_mention} "
-    "so they can complete your registration. ✅"
-)
+# ── Default channel / category names (used when creating new ones via /setup) ─
+WELCOME_CATEGORY        = "New Members"
+RACES_CATEGORY          = "Races"
+CHANNEL_LINEUP          = "team-manager-lineups"
+CHANNEL_ROLE_REQUESTS   = "role-requests"
+CHANNEL_CAR_SETUPS      = "car-setups"
 
-# ── Welcome channel settings ───────────────────────────────────────────────────
-# Category name for temporary welcome channels (visible to owner + CEO only)
-WELCOME_CATEGORY      = "New Members"
-# Days after join before the bot sends a reminder in the welcome channel
-WELCOME_REMINDER_DAYS = 2
-# Days after join before the bot kicks the member and deletes the channel
-WELCOME_KICK_DAYS     = 7
+# ── Welcome timeout ───────────────────────────────────────────────────────────
+# Hours before a member who hasn't picked a role is kicked
+WELCOME_TIMEOUT_HOURS = 12
+
+# ── Setup wizard config keys (stored in guild_config table) ───────────────────
+# Roles
+CFG_ROLE_DRIVER     = "role_driver"
+CFG_ROLE_ENGINEER   = "role_engineer"
+CFG_ROLE_LIVERY     = "role_livery"
+CFG_ROLE_VISITOR    = "role_visitor"
+CFG_ROLE_UPDATES    = "role_updates"
+CFG_ROLE_CEO        = "role_ceo"
+CFG_ROLE_TM         = "role_tm"
+# Channels / categories
+CFG_CAT_WELCOME     = "category_welcome"
+CFG_CAT_RACES       = "category_races"
+CFG_CH_ROLE_REQ     = "channel_role_requests"
+CFG_CH_CAR_SETUPS   = "channel_car_setups"
+CFG_CH_LINEUP       = "channel_lineup"

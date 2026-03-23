@@ -2,106 +2,143 @@
 Greeting cog
 ────────────
 • Listens for new members joining the guild.
-• Creates a temporary private channel  #welcome-<username>  inside a
-  "New Members" category that is only visible to the guild owner and CEO.
-  The channel itself is also visible to the new member.
-• After the member picks a role the channel is automatically deleted.
-• If they don't pick:
-    - After WELCOME_REMINDER_DAYS (2) days  → reminder message in the channel.
-    - After WELCOME_KICK_DAYS (7) days      → member is kicked, channel deleted.
-• If Racer is chosen:
-    - Creates a permanent private channel  #racer-<username>
-      visible to the member, CEO and Team Manager.
-    - Posts onboarding instructions that tag Team Manager.
-    - A background task checks every hour; if Team Manager has not
-      posted in that channel after RACER_REMINDER_DAYS days it tags CEO too.
+• Creates a temporary private channel  #welcome-<username>  inside the
+  configured welcome category (visible to guild owner, CEO, TM, and the member).
+• Member picks their role via buttons:
+    Driver | Engineer | Livery Designer | Visitor | Updates Only
+• On pick: role assigned instantly, channel deleted after a short pause.
+• If no pick within 12 hours: member is kicked, channel deleted.
+  State is persisted in SQLite so the timeout survives bot restarts.
+
+/test-welcome  — manually trigger the flow for a user (CEO / TM only).
 """
 
 import asyncio
-import dataclasses
 import datetime
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+import db
 from config import (
-    ROLE_RACER, ROLE_VISITOR, ROLE_UPDATES,
+    ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
-    RACER_REMINDER_DAYS, RACER_ONBOARDING_MSG,
-    WELCOME_CATEGORY, WELCOME_REMINDER_DAYS, WELCOME_KICK_DAYS,
+    CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
+    CFG_ROLE_VISITOR, CFG_ROLE_UPDATES,
+    CFG_CAT_WELCOME, WELCOME_CATEGORY,
+    WELCOME_TIMEOUT_HOURS,
 )
 
 
-# ── in-memory state ───────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-@dataclasses.dataclass
-class WelcomeEntry:
-    member_id:      int
-    guild_id:       int
-    joined_at:      datetime.datetime
-    reminder_sent:  bool = False
-
-
-# channel_id → WelcomeEntry  (resets on bot restart)
-_pending_welcome: dict[int, WelcomeEntry] = {}
-
-# channel_id → created_at  (racer onboarding reminder tracker)
-_pending_racer_channels: dict[int, datetime.datetime] = {}
+def _resolve_role(guild: discord.Guild, cfg_key: str, fallback_name: str) -> discord.Role | None:
+    raw_id = db.get_config(guild.id, cfg_key)
+    if raw_id:
+        role = guild.get_role(int(raw_id))
+        if role:
+            return role
+    return discord.utils.get(guild.roles, name=fallback_name)
 
 
-# ── view ──────────────────────────────────────────────────────────────────────
+async def _get_or_create_welcome_category(guild: discord.Guild) -> discord.CategoryChannel:
+    raw_id = db.get_config(guild.id, CFG_CAT_WELCOME)
+    if raw_id:
+        cat = guild.get_channel(int(raw_id))
+        if isinstance(cat, discord.CategoryChannel):
+            return cat
+
+    cat = discord.utils.get(guild.categories, name=WELCOME_CATEGORY)
+    if cat:
+        return cat
+
+    ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
+    tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(
+            view_channel=True, manage_channels=True, send_messages=True
+        ),
+    }
+    if guild.owner:
+        overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
+    if ceo_role:
+        overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
+    if tm_role:
+        overwrites[tm_role] = discord.PermissionOverwrite(view_channel=True)
+
+    cat = await guild.create_category(
+        name=WELCOME_CATEGORY,
+        overwrites=overwrites,
+        reason="Welcome channels category",
+    )
+    db.set_config(guild.id, CFG_CAT_WELCOME, str(cat.id))
+    return cat
+
+
+# ── join view ─────────────────────────────────────────────────────────────────
 
 class JoinView(discord.ui.View):
-    """Role-picker buttons posted in the temporary welcome channel."""
+    """Role-picker shown in the temporary welcome channel."""
 
     def __init__(self, member: discord.Member, channel: discord.TextChannel):
-        super().__init__(timeout=None)  # background task handles expiry
+        super().__init__(timeout=None)
         self.member  = member
         self.channel = channel
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    async def _pick(
+        self,
+        interaction: discord.Interaction,
+        cfg_key: str,
+        fallback_name: str,
+        label: str,
+    ):
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message(
+                "This welcome is not for you.", ephemeral=True
+            )
+            return
 
-    async def _assign(self, role_name: str):
-        role = discord.utils.get(self.member.guild.roles, name=role_name)
+        role = _resolve_role(self.member.guild, cfg_key, fallback_name)
         if role:
-            await self.member.add_roles(role)
+            await self.member.add_roles(role, reason=f"Welcome role pick: {label}")
 
-    async def _finish(self, interaction: discord.Interaction, label: str):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Got it! You've been registered as **{label}**.\nThis channel will be removed in a few seconds.",
+            content=f"✅ Got it! You've been registered as **{label}**. Welcome!",
             view=self,
         )
         self.stop()
-        # Unregister so the background task ignores it
-        _pending_welcome.pop(self.channel.id, None)
+
+        # Remove from DB and delete the channel after a brief pause
+        db.remove_welcome(self.channel.id)
         await asyncio.sleep(5)
         try:
             await self.channel.delete(reason="Welcome flow complete")
         except discord.NotFound:
             pass
 
-    # ── buttons ───────────────────────────────────────────────────────────────
+    @discord.ui.button(label="🏎️ Driver",          style=discord.ButtonStyle.primary)
+    async def btn_driver(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._pick(interaction, CFG_ROLE_DRIVER, ROLE_DRIVER, "Driver")
 
-    @discord.ui.button(label="🏎️ Racer", style=discord.ButtonStyle.primary)
-    async def btn_racer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._assign(ROLE_RACER)
-        await self._finish(interaction, "Racer")
-        # Racer channel creation runs after the channel is deleted
-        asyncio.create_task(
-            interaction.client.cogs["Greeting"]._create_racer_channel(self.member)  # type: ignore[attr-defined]
-        )
+    @discord.ui.button(label="🔧 Engineer",         style=discord.ButtonStyle.primary)
+    async def btn_engineer(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._pick(interaction, CFG_ROLE_ENGINEER, ROLE_ENGINEER, "Engineer")
 
-    @discord.ui.button(label="👀 Just Visiting", style=discord.ButtonStyle.secondary)
-    async def btn_visitor(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._assign(ROLE_VISITOR)
-        await self._finish(interaction, "Visitor")
+    @discord.ui.button(label="🎨 Livery Designer",  style=discord.ButtonStyle.primary)
+    async def btn_livery(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._pick(interaction, CFG_ROLE_LIVERY, ROLE_LIVERY, "Livery Designer")
 
-    @discord.ui.button(label="📢 Updates Only", style=discord.ButtonStyle.secondary)
-    async def btn_updates(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._assign(ROLE_UPDATES)
-        await self._finish(interaction, "Updates Only")
+    @discord.ui.button(label="👀 Just Visiting",    style=discord.ButtonStyle.secondary, row=1)
+    async def btn_visitor(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._pick(interaction, CFG_ROLE_VISITOR, ROLE_VISITOR, "Visitor")
+
+    @discord.ui.button(label="📢 Updates Only",     style=discord.ButtonStyle.secondary, row=1)
+    async def btn_updates(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._pick(interaction, CFG_ROLE_UPDATES, ROLE_UPDATES, "Updates Only")
 
 
 # ── cog ───────────────────────────────────────────────────────────────────────
@@ -110,39 +147,9 @@ class Greeting(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.check_welcome_channels.start()
-        self.check_racer_channels.start()
 
     def cog_unload(self):
         self.check_welcome_channels.cancel()
-        self.check_racer_channels.cancel()
-
-    # ── welcome category ──────────────────────────────────────────────────────
-
-    async def _get_or_create_welcome_category(self, guild: discord.Guild) -> discord.CategoryChannel:
-        """Return the 'New Members' category, creating it if absent.
-
-        Visible to: guild owner, CEO role only.
-        Individual welcome channels add their member on top of this.
-        """
-        category = discord.utils.get(guild.categories, name=WELCOME_CATEGORY)
-        if category:
-            return category
-
-        ceo_role = discord.utils.get(guild.roles, name=ROLE_CEO)
-        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True),
-        }
-        if guild.owner:
-            overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
-        if ceo_role:
-            overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
-
-        return await guild.create_category(
-            name=WELCOME_CATEGORY,
-            overwrites=overwrites,
-            reason="Welcome channels category",
-        )
 
     # ── new member ────────────────────────────────────────────────────────────
 
@@ -152,13 +159,25 @@ class Greeting(commands.Cog):
 
     async def _run_welcome(self, member: discord.Member):
         guild    = member.guild
-        category = await self._get_or_create_welcome_category(guild)
+        category = await _get_or_create_welcome_category(guild)
 
-        # Channel is visible to owner/CEO (inherited from category) + the member
-        overwrites = {
+        ceo_role = _resolve_role(guild, "role_ceo", ROLE_CEO)
+        tm_role  = _resolve_role(guild, "role_tm",  ROLE_TEAM_MANAGER)
+
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member:             discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            guild.me:           discord.PermissionOverwrite(
+                view_channel=True, manage_channels=True, send_messages=True
+            ),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=False),
         }
+        if guild.owner:
+            overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
+        if ceo_role:
+            overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
+        if tm_role:
+            overwrites[tm_role] = discord.PermissionOverwrite(view_channel=True)
+
         channel = await guild.create_text_channel(
             name=f"welcome-{member.name}",
             category=category,
@@ -169,147 +188,62 @@ class Greeting(commands.Cog):
         view = JoinView(member, channel)
         await channel.send(
             f"👋 Hey {member.mention}, welcome to **{guild.name}**!\n\n"
-            "What brings you here? Pick your role below:",
+            "Pick the role that best describes you below.\n"
+            "This channel will be removed automatically after you pick "
+            f"(or in {WELCOME_TIMEOUT_HOURS}h if you don't).",
             view=view,
         )
 
-        # Register for background follow-up
-        _pending_welcome[channel.id] = WelcomeEntry(
-            member_id=member.id,
+        db.add_welcome(
+            channel_id=channel.id,
             guild_id=guild.id,
-            joined_at=datetime.datetime.utcnow(),
+            member_id=member.id,
+            created_at=datetime.datetime.utcnow().isoformat(),
         )
 
-    # ── background: reminder + kick for non-responders ────────────────────────
+    # ── background: 12h kick for non-responders ───────────────────────────────
 
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=30)
     async def check_welcome_channels(self):
-        now = datetime.datetime.utcnow()
+        cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(hours=WELCOME_TIMEOUT_HOURS)
+        ).isoformat()
+        expired = db.get_expired_welcomes(cutoff)
 
-        for channel_id, entry in list(_pending_welcome.items()):
-            age = now - entry.joined_at
-
-            channel = self.bot.get_channel(channel_id)
-            guild   = self.bot.get_guild(entry.guild_id)
+        for row in expired:
+            guild   = self.bot.get_guild(row["guild_id"])
             if guild is None:
-                _pending_welcome.pop(channel_id, None)
+                db.remove_welcome(row["channel_id"])
                 continue
 
-            member = guild.get_member(entry.member_id)
+            member  = guild.get_member(row["member_id"])
+            channel = self.bot.get_channel(row["channel_id"])
 
-            # ── 7 days: kick + delete ─────────────────────────────────────────
-            if age >= datetime.timedelta(days=WELCOME_KICK_DAYS):
-                if member:
-                    try:
-                        await member.kick(reason="Did not pick a role within 7 days.")
-                    except discord.Forbidden:
-                        pass
-                if channel:
-                    try:
-                        await channel.delete(reason="Welcome timed out (7 days).")
-                    except discord.NotFound:
-                        pass
-                _pending_welcome.pop(channel_id, None)
-                continue
+            if member:
+                try:
+                    await member.kick(
+                        reason=f"Did not pick a role within {WELCOME_TIMEOUT_HOURS}h."
+                    )
+                except discord.Forbidden:
+                    pass
 
-            # ── 2 days: reminder ──────────────────────────────────────────────
-            if (
-                age >= datetime.timedelta(days=WELCOME_REMINDER_DAYS)
-                and not entry.reminder_sent
-                and channel
-                and member
-            ):
-                await channel.send(
-                    f"👋 Hey {member.mention}, just a reminder to pick your role above!\n"
-                    f"If no choice is made within **{WELCOME_KICK_DAYS} days** of joining "
-                    "you will be automatically removed from the server."
-                )
-                entry.reminder_sent = True
+            if channel:
+                try:
+                    await channel.delete(reason="Welcome timed out.")
+                except discord.NotFound:
+                    pass
+
+            db.remove_welcome(row["channel_id"])
 
     @check_welcome_channels.before_loop
-    async def before_check_welcome(self):
+    async def before_check(self):
         await self.bot.wait_until_ready()
 
-    # ── racer channel creation ────────────────────────────────────────────────
-
-    async def _create_racer_channel(self, member: discord.Member):
-        guild    = member.guild
-        ceo_role = discord.utils.get(guild.roles, name=ROLE_CEO)
-        tm_role  = discord.utils.get(guild.roles, name=ROLE_TEAM_MANAGER)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member:             discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
-        if ceo_role:
-            overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-        if tm_role:
-            overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-        channel = await guild.create_text_channel(
-            name=f"racer-{member.name}",
-            overwrites=overwrites,
-            topic=f"Racer onboarding for {member} | created:{datetime.datetime.utcnow().isoformat()}",
-            reason="Racer onboarding",
-        )
-
-        _pending_racer_channels[channel.id] = datetime.datetime.utcnow()
-
-        tm_mention = tm_role.mention if tm_role else "@Team-Manager"
-        await channel.send(
-            RACER_ONBOARDING_MSG.format(
-                mention=member.mention,
-                team_manager_mention=tm_mention,
-            )
-        )
-
-    # ── background: remind CEO if TM hasn't responded ────────────────────────
-
-    @tasks.loop(hours=1)
-    async def check_racer_channels(self):
-        now      = datetime.datetime.utcnow()
-        deadline = datetime.timedelta(days=RACER_REMINDER_DAYS)
-        to_remove = []
-
-        for channel_id, created_at in list(_pending_racer_channels.items()):
-            if now - created_at < deadline:
-                continue
-
-            channel = self.bot.get_channel(channel_id)
-            if channel is None:
-                to_remove.append(channel_id)
-                continue
-
-            tm_role  = discord.utils.get(channel.guild.roles, name=ROLE_TEAM_MANAGER)
-            ceo_role = discord.utils.get(channel.guild.roles, name=ROLE_CEO)
-
-            async for msg in channel.history(limit=50):
-                if msg.author.bot:
-                    continue
-                member_roles = [r.id for r in getattr(msg.author, "roles", [])]
-                if tm_role and tm_role.id in member_roles:
-                    to_remove.append(channel_id)
-                    break
-            else:
-                if ceo_role:
-                    await channel.send(
-                        f"⚠️ {ceo_role.mention} — no response from {ROLE_TEAM_MANAGER} "
-                        f"after {RACER_REMINDER_DAYS} days. Please follow up!"
-                    )
-                to_remove.append(channel_id)
-
-        for cid in to_remove:
-            _pending_racer_channels.pop(cid, None)
-
-    @check_racer_channels.before_loop
-    async def before_check_racer(self):
-        await self.bot.wait_until_ready()
-
-    # ── test command ──────────────────────────────────────────────────────────
+    # ── /test-welcome ─────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="test-welcome",
-        description="Trigger the welcome channel flow for a user (CEO / Team Manager only).",
+        description="Trigger the welcome channel flow for a user (CEO / TM only).",
     )
     @app_commands.describe(user="The member to send the welcome message to")
     @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
@@ -323,7 +257,8 @@ class Greeting(commands.Cog):
         except discord.Forbidden as e:
             await interaction.followup.send(
                 f"❌ Missing permission: `{e.text}`\n"
-                "Make sure the bot has **Manage Channels** in the server.", ephemeral=True
+                "Make sure the bot has **Manage Channels** in the server.",
+                ephemeral=True,
             )
         except Exception as e:
             await interaction.followup.send(
