@@ -94,8 +94,33 @@ async def _get_or_create_races_category(guild: discord.Guild) -> discord.Categor
     return cat
 
 
+async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
+    """Remove Race-* roles from every driver registered in the given event."""
+    event = db.get_event(event_id)
+    if not event:
+        return
+    lineup: dict = event["lineup"]
+    slots:  list = event["slots"]
+
+    # Collect the distinct car names used in this event
+    car_names = {s["car_name"] for s in slots}
+
+    for member_id in lineup.values():
+        member = guild.get_member(int(member_id))
+        if not member:
+            continue
+        roles_to_remove = [
+            r for r in member.roles
+            if r.name.startswith(RACE_ROLE_PREFIX)
+            and r.name[len(RACE_ROLE_PREFIX):] in car_names
+        ]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Race event concluded")
+
+
 def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
-    date_str = event["date_utc"]
+    # Display format: "2026-03-28 20:00" (human-readable, space instead of T)
+    date_str  = event["date_utc"].replace("T", " ")
     confirmed = event.get("confirmed", 0)
 
     embed = discord.Embed(
@@ -255,11 +280,12 @@ class ResultsModal(discord.ui.Modal, title="Post Race Results"):
         self.event_id = event_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        import datetime as _dt
         results = {
             "positions": self.positions.value,
             "notes":     self.notes.value or "",
         }
-        db.set_results(self.event_id, results)
+        db.set_results(self.event_id, results, _dt.datetime.utcnow().isoformat())
 
         embed = discord.Embed(
             title="🏆 Race Results",
@@ -276,7 +302,9 @@ class ResultsModal(discord.ui.Modal, title="Post Race Results"):
         except discord.Forbidden:
             pass
 
-        await interaction.response.send_message("✅ Results posted.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ Results posted. Race-* roles will be removed 48h after the race.", ephemeral=True
+        )
 
 
 # ── cog ───────────────────────────────────────────────────────────────────────
@@ -345,7 +373,7 @@ class RaceEvent(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         slots     = _build_slots(guild.id, car_names)
-        date_str  = dt.strftime("%Y-%m-%d %H:%M")
+        date_str  = dt.strftime("%Y-%m-%dT%H:%M")
         event_id  = db.create_event(guild.id, name, date_str, slots)
 
         # Create race channel
@@ -491,7 +519,7 @@ class RaceEvent(commands.Cog):
                     continue
 
                 try:
-                    race_dt = datetime.datetime.strptime(event["date_utc"], "%Y-%m-%d %H:%M")
+                    race_dt = datetime.datetime.fromisoformat(event["date_utc"])
                 except ValueError:
                     continue
 
@@ -523,6 +551,14 @@ class RaceEvent(commands.Cog):
                         embed=embed,
                     )
                     db.mark_reminder(event["id"], "1h")
+
+        # 48h post-results: clean up Race-* roles
+        cleanup_cutoff = (now - datetime.timedelta(hours=48)).isoformat()
+        for event in db.get_events_due_cleanup(cleanup_cutoff):
+            guild = self.bot.get_guild(event["guild_id"])
+            if guild:
+                await _cleanup_race_roles(guild, event["id"])
+                db.mark_roles_cleaned(event["id"])
 
     def _driver_mentions(self, guild: discord.Guild, lineup: dict) -> str:
         mentions = []
