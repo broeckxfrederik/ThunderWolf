@@ -119,7 +119,8 @@ async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
 
 
 def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
-    date_str = event["date_utc"]
+    # Display format: "2026-03-28 20:00" (human-readable, space instead of T)
+    date_str  = event["date_utc"].replace("T", " ")
     confirmed = event.get("confirmed", 0)
 
     embed = discord.Embed(
@@ -372,7 +373,7 @@ class RaceEvent(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         slots     = _build_slots(guild.id, car_names)
-        date_str  = dt.strftime("%Y-%m-%d %H:%M")
+        date_str  = dt.strftime("%Y-%m-%dT%H:%M")
         event_id  = db.create_event(guild.id, name, date_str, slots)
 
         # Create race channel
@@ -518,7 +519,7 @@ class RaceEvent(commands.Cog):
                     continue
 
                 try:
-                    race_dt = datetime.datetime.strptime(event["date_utc"], "%Y-%m-%d %H:%M")
+                    race_dt = datetime.datetime.fromisoformat(event["date_utc"])
                 except ValueError:
                     continue
 
