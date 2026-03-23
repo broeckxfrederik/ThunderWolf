@@ -94,6 +94,30 @@ async def _get_or_create_races_category(guild: discord.Guild) -> discord.Categor
     return cat
 
 
+async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
+    """Remove Race-* roles from every driver registered in the given event."""
+    event = db.get_event(event_id)
+    if not event:
+        return
+    lineup: dict = event["lineup"]
+    slots:  list = event["slots"]
+
+    # Collect the distinct car names used in this event
+    car_names = {s["car_name"] for s in slots}
+
+    for member_id in lineup.values():
+        member = guild.get_member(int(member_id))
+        if not member:
+            continue
+        roles_to_remove = [
+            r for r in member.roles
+            if r.name.startswith(RACE_ROLE_PREFIX)
+            and r.name[len(RACE_ROLE_PREFIX):] in car_names
+        ]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Race event concluded")
+
+
 def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
     date_str = event["date_utc"]
     confirmed = event.get("confirmed", 0)
@@ -275,6 +299,9 @@ class ResultsModal(discord.ui.Modal, title="Post Race Results"):
             await msg.pin()
         except discord.Forbidden:
             pass
+
+        # Clean up Race-* roles for drivers registered in this event
+        await _cleanup_race_roles(interaction.guild, self.event_id)
 
         await interaction.response.send_message("✅ Results posted.", ephemeral=True)
 
