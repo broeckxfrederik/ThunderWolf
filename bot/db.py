@@ -48,8 +48,10 @@ CREATE TABLE IF NOT EXISTS events (
     lineup_json         TEXT    NOT NULL DEFAULT '{}',
     confirmed           INTEGER NOT NULL DEFAULT 0,
     results_json        TEXT,
+    results_at          TEXT,
     reminder_24h_sent   INTEGER NOT NULL DEFAULT 0,
-    reminder_1h_sent    INTEGER NOT NULL DEFAULT 0
+    reminder_1h_sent    INTEGER NOT NULL DEFAULT 0,
+    roles_cleaned       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS welcome_channels (
@@ -225,11 +227,11 @@ def confirm_event(event_id: int) -> None:
         c.execute("UPDATE events SET confirmed=1 WHERE id=?", (event_id,))
 
 
-def set_results(event_id: int, results: dict) -> None:
+def set_results(event_id: int, results: dict, results_at: str) -> None:
     with _conn() as c:
         c.execute(
-            "UPDATE events SET results_json=? WHERE id=?",
-            (json.dumps(results), event_id),
+            "UPDATE events SET results_json=?, results_at=? WHERE id=?",
+            (json.dumps(results), results_at, event_id),
         )
 
 
@@ -237,6 +239,28 @@ def mark_reminder(event_id: int, which: str) -> None:
     col = "reminder_24h_sent" if which == "24h" else "reminder_1h_sent"
     with _conn() as c:
         c.execute(f"UPDATE events SET {col}=1 WHERE id=?", (event_id,))
+
+
+def mark_roles_cleaned(event_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE events SET roles_cleaned=1 WHERE id=?", (event_id,))
+
+
+def get_events_due_cleanup(before_iso: str) -> list[dict]:
+    """Return events whose results were posted before before_iso and haven't been cleaned yet."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM events WHERE results_at IS NOT NULL "
+            "AND results_at <= ? AND roles_cleaned=0",
+            (before_iso,),
+        ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["slots"]  = json.loads(d.pop("slots_json"))
+        d["lineup"] = json.loads(d.pop("lineup_json"))
+        out.append(d)
+    return out
 
 
 # ── welcome_channels ──────────────────────────────────────────────────────────
