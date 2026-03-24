@@ -25,6 +25,7 @@ from config import (
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CH_ROLE_REQ, CHANNEL_ROLE_REQUESTS,
+    CFG_CH_ROLE_APPROVALS, CHANNEL_ROLE_APPROVALS,
 )
 
 # All assignable team roles in priority order
@@ -101,6 +102,41 @@ async def _get_role_requests_channel(guild: discord.Guild) -> discord.TextChanne
             reason="Role requests channel",
         )
         db.set_config(guild.id, CFG_CH_ROLE_REQ, str(ch.id))
+        return ch
+    except discord.Forbidden:
+        return None
+
+
+async def _get_role_approvals_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Private TM/CEO-only channel where approval cards with buttons are posted."""
+    raw_id = db.get_config(guild.id, CFG_CH_ROLE_APPROVALS)
+    if raw_id:
+        ch = guild.get_channel(int(raw_id))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+
+    ch = discord.utils.get(guild.text_channels, name=CHANNEL_ROLE_APPROVALS)
+    if ch:
+        db.set_config(guild.id, CFG_CH_ROLE_APPROVALS, str(ch.id))
+        return ch
+
+    ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+    tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if ceo_role:
+        overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    if tm_role:
+        overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    try:
+        ch = await guild.create_text_channel(
+            CHANNEL_ROLE_APPROVALS,
+            overwrites=overwrites,
+            reason="Role approvals channel",
+        )
+        db.set_config(guild.id, CFG_CH_ROLE_APPROVALS, str(ch.id))
         return ch
     except discord.Forbidden:
         return None
@@ -315,10 +351,14 @@ class Roles(commands.Cog):
 
         req_id = db.create_role_request(guild.id, member.id, role)
 
-        ch = await _get_role_requests_channel(guild)
-        if ch is None:
+        # Post notification in #role-requests (visible log)
+        req_ch = await _get_role_requests_channel(guild)
+
+        # Post approval card with buttons in the separate #role-approvals channel
+        approval_ch = await _get_role_approvals_channel(guild)
+        if approval_ch is None:
             await interaction.followup.send(
-                "❌ Could not find or create the #role-requests channel. "
+                "❌ Could not find or create the #role-approvals channel. "
                 "Ask a CEO/TM to run `/setup`.",
                 ephemeral=True,
             )
@@ -326,10 +366,16 @@ class Roles(commands.Cog):
 
         embed = _request_embed(member, current_role, role)
         view  = RequestCardView(req_id, member, role)
-        msg   = await ch.send(embed=embed, view=view)
+        msg   = await approval_ch.send(embed=embed, view=view)
 
-        db.set_request_message(req_id, msg.id, ch.id)
+        db.set_request_message(req_id, msg.id, approval_ch.id)
         self.bot.add_view(view)
+
+        # Also log in #role-requests without buttons (no action needed there)
+        if req_ch:
+            log_embed = _request_embed(member, current_role, role)
+            log_embed.set_footer(text=f"Status: Pending | Review in #{approval_ch.name}")
+            await req_ch.send(embed=log_embed)
 
         await interaction.followup.send(
             f"✅ Your request for **{role}** has been submitted. "
