@@ -11,7 +11,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import REACTION_ROLES, ROLE_CEO, ROLE_TEAM_MANAGER
+from config import (
+    REACTION_ROLES, ROLE_CEO, ROLE_TEAM_MANAGER,
+    ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
+)
 
 
 # message_id of the active reaction-role post (in-memory)
@@ -29,10 +32,22 @@ class ReactionRoles(commands.Cog):
     async def post_roles(self, interaction: discord.Interaction):
         global _reaction_message_id
 
-        lines = ["**🎭 Pick your extra roles!**\n"]
+        lines = [
+            "**🎭 Server Roles**\n",
+            "**Team roles** — use `/role-request` to apply:",
+        ]
+        team_role_lines = [
+            f"🏎️ — **{ROLE_DRIVER}**",
+            f"🔧 — **{ROLE_ENGINEER}**",
+            f"🎨 — **{ROLE_LIVERY}**",
+            f"👤 — **{ROLE_VISITOR}**",
+            f"🔔 — **{ROLE_UPDATES}**",
+        ]
+        lines.extend(team_role_lines)
+
+        lines.append(f"\n**Opt-in roles** — react below to add or remove:")
         for emoji, role_name in REACTION_ROLES.items():
             lines.append(f"{emoji} — **{role_name}**")
-        lines.append("\nReact below to add or remove a role.")
 
         msg = await interaction.channel.send("\n".join(lines))
 
