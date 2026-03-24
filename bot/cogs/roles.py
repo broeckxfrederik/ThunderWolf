@@ -3,8 +3,9 @@ Roles cog
 ─────────
 /role-request role:…
     Any member can request a role change (e.g. Driver → Engineer).
-    Posts a request card in the private #role-requests channel.
-    CEO / TM approves or denies via buttons on the card.
+    Team roles (Driver, Engineer, etc.) post a request card in the private
+    #role-requests channel for CEO/TM to approve or deny.
+    Opt-in notification roles are assigned immediately without approval.
 
     On Approve: team role swapped, member notified via DM.
     On Deny:    TM enters a brief reason in a modal, member notified.
@@ -19,6 +20,7 @@ from discord.ext import commands
 import db
 from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
+    ROLE_F1, ROLE_TWITCH, ROLE_DRIVER_NOTIF,
     ROLE_CEO, ROLE_TEAM_MANAGER,
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
@@ -34,12 +36,18 @@ TEAM_ROLES = [
     (CFG_ROLE_UPDATES,  ROLE_UPDATES),
 ]
 
+# Opt-in roles that don't need TM approval
+OPT_IN_ROLES = [ROLE_F1, ROLE_TWITCH, ROLE_DRIVER_NOTIF]
+
 ROLE_CHOICES = [
-    app_commands.Choice(name="Driver",          value=ROLE_DRIVER),
-    app_commands.Choice(name="Engineer",         value=ROLE_ENGINEER),
-    app_commands.Choice(name="Livery Designer",  value=ROLE_LIVERY),
-    app_commands.Choice(name="Visitor",          value=ROLE_VISITOR),
-    app_commands.Choice(name="Updates Only",     value=ROLE_UPDATES),
+    app_commands.Choice(name="Driver",                value=ROLE_DRIVER),
+    app_commands.Choice(name="Engineer",              value=ROLE_ENGINEER),
+    app_commands.Choice(name="Livery Designer",       value=ROLE_LIVERY),
+    app_commands.Choice(name="Visitor",               value=ROLE_VISITOR),
+    app_commands.Choice(name="Updates Only",          value=ROLE_UPDATES),
+    app_commands.Choice(name="F1 Updates",            value=ROLE_F1),
+    app_commands.Choice(name="Twitch Notifications",  value=ROLE_TWITCH),
+    app_commands.Choice(name="Driver Notification",   value=ROLE_DRIVER_NOTIF),
 ]
 
 
@@ -110,10 +118,7 @@ def _request_embed(
         "denied":   discord.Colour.red(),
     }.get(status, discord.Colour.orange())
 
-    embed = discord.Embed(
-        title="🔄 Role Request",
-        colour=colour,
-    )
+    embed = discord.Embed(title="🔄 Role Request", colour=colour)
     embed.add_field(name="Member",         value=member.mention,   inline=True)
     embed.add_field(name="Current Role",   value=current_role,     inline=True)
     embed.add_field(name="Requested Role", value=requested_role,   inline=True)
@@ -134,8 +139,8 @@ class DenyModal(discord.ui.Modal, title="Deny Role Request"):
 
     def __init__(self, request_id: int, member: discord.Member, requested_role: str):
         super().__init__()
-        self.request_id    = request_id
-        self.member        = member
+        self.request_id     = request_id
+        self.member         = member
         self.requested_role = requested_role
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -150,8 +155,6 @@ class DenyModal(discord.ui.Modal, title="Deny Role Request"):
         except discord.Forbidden:
             pass
 
-        # Update the card embed
-        req = db.get_role_request(self.request_id)
         current_role = _current_team_role(self.member)
         embed = _request_embed(self.member, current_role, self.requested_role, "denied")
         await interaction.response.edit_message(embed=embed, view=None)
@@ -165,6 +168,22 @@ class RequestCardView(discord.ui.View):
         self.request_id     = request_id
         self.member         = member
         self.requested_role = requested_role
+
+        approve_btn = discord.ui.Button(
+            label="✅ Approve",
+            style=discord.ButtonStyle.success,
+            custom_id=f"rr_approve_{request_id}",
+        )
+        approve_btn.callback = self._approve
+        self.add_item(approve_btn)
+
+        deny_btn = discord.ui.Button(
+            label="❌ Deny",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"rr_deny_{request_id}",
+        )
+        deny_btn.callback = self._deny
+        self.add_item(deny_btn)
 
     async def _check_authority(self, interaction: discord.Interaction) -> bool:
         guild    = interaction.guild
@@ -181,9 +200,7 @@ class RequestCardView(discord.ui.View):
             )
         return has_auth
 
-    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success,
-                       custom_id="rr_approve")
-    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def _approve(self, interaction: discord.Interaction):
         if not await self._check_authority(interaction):
             return
 
@@ -204,7 +221,6 @@ class RequestCardView(discord.ui.View):
         # Find and assign the requested role
         new_role = discord.utils.get(guild.roles, name=self.requested_role)
         if new_role is None:
-            # Try resolving via config
             for cfg_key, fallback in TEAM_ROLES:
                 if fallback == self.requested_role:
                     new_role = _resolve_role(guild, cfg_key, fallback)
@@ -227,9 +243,7 @@ class RequestCardView(discord.ui.View):
         embed = _request_embed(member, current_role, self.requested_role, "approved")
         await interaction.response.edit_message(embed=embed, view=None)
 
-    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger,
-                       custom_id="rr_deny")
-    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def _deny(self, interaction: discord.Interaction):
         if not await self._check_authority(interaction):
             return
         await interaction.response.send_modal(
@@ -243,17 +257,54 @@ class Roles(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_load(self):
+        # Restore RequestCardViews for all pending requests after restart.
+        self.bot.loop.create_task(self._restore_views())
+
+    async def _restore_views(self):
+        await self.bot.wait_until_ready()
+        for row in db.get_pending_role_requests():
+            guild = self.bot.get_guild(row["guild_id"])
+            if guild is None:
+                continue
+            member = guild.get_member(row["member_id"])
+            if member is None:
+                continue
+            view = RequestCardView(row["id"], member, row["requested_role"])
+            self.bot.add_view(view)
+
     @app_commands.command(
         name="role-request",
-        description="Request a role change (e.g. Driver → Engineer).",
+        description="Request a role (team roles require TM approval; opt-in roles are instant).",
     )
     @app_commands.describe(role="The role you want")
     @app_commands.choices(role=ROLE_CHOICES)
     async def role_request(self, interaction: discord.Interaction, role: str):
-        member       = interaction.user
-        guild        = interaction.guild
-        current_role = _current_team_role(member)
+        member = interaction.user
+        guild  = interaction.guild
 
+        # Opt-in roles: grant/remove immediately without TM approval
+        if role in OPT_IN_ROLES:
+            discord_role = discord.utils.get(guild.roles, name=role)
+            if discord_role is None:
+                await interaction.response.send_message(
+                    f"❌ Role **{role}** not found on this server.", ephemeral=True
+                )
+                return
+            if discord_role in member.roles:
+                await member.remove_roles(discord_role, reason="Role request self-serve")
+                await interaction.response.send_message(
+                    f"✅ Removed **{role}**.", ephemeral=True
+                )
+            else:
+                await member.add_roles(discord_role, reason="Role request self-serve")
+                await interaction.response.send_message(
+                    f"✅ Added **{role}**.", ephemeral=True
+                )
+            return
+
+        # Team roles: go through approval flow
+        current_role = _current_team_role(member)
         if current_role == role:
             await interaction.response.send_message(
                 f"You already have the **{role}** role.", ephemeral=True
@@ -262,10 +313,8 @@ class Roles(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # Create DB record
         req_id = db.create_role_request(guild.id, member.id, role)
 
-        # Post card in #role-requests
         ch = await _get_role_requests_channel(guild)
         if ch is None:
             await interaction.followup.send(
