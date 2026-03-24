@@ -173,36 +173,52 @@ class DenyModal(discord.ui.Modal, title="Deny Role Request"):
         placeholder="Optional — leave blank for a generic denial.",
     )
 
-    def __init__(self, request_id: int, member: discord.Member, requested_role: str):
+    def __init__(self, request_id: int, member_id: int, requested_role: str):
         super().__init__()
         self.request_id     = request_id
-        self.member         = member
+        self.member_id      = member_id
         self.requested_role = requested_role
 
     async def on_submit(self, interaction: discord.Interaction):
         db.update_request_status(self.request_id, "denied")
 
-        reason_text = self.reason.value.strip() or "No reason given."
-        try:
-            await self.member.send(
-                f"❌ Your request for the **{self.requested_role}** role was **denied**.\n"
-                f"Reason: {reason_text}"
-            )
-        except discord.Forbidden:
-            pass
+        guild  = interaction.guild
+        member = guild.get_member(self.member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(self.member_id)
+            except discord.NotFound:
+                member = None
 
-        current_role = _current_team_role(self.member)
-        embed = _request_embed(self.member, current_role, self.requested_role, "denied")
+        reason_text = self.reason.value.strip() or "No reason given."
+        if member:
+            try:
+                await member.send(
+                    f"❌ Your request for the **{self.requested_role}** role was **denied**.\n"
+                    f"Reason: {reason_text}"
+                )
+            except discord.Forbidden:
+                pass
+            current_role = _current_team_role(member)
+            embed = _request_embed(member, current_role, self.requested_role, "denied")
+        else:
+            embed = discord.Embed(
+                title="🔄 Role Request",
+                colour=discord.Colour.red(),
+                description=f"Request for **{self.requested_role}** denied (member left the server).",
+            )
+            embed.set_footer(text="Status: Denied")
+
         await interaction.response.edit_message(embed=embed, view=None)
 
 
 # ── request card view ─────────────────────────────────────────────────────────
 
 class RequestCardView(discord.ui.View):
-    def __init__(self, request_id: int, member: discord.Member, requested_role: str):
+    def __init__(self, request_id: int, member_id: int, requested_role: str):
         super().__init__(timeout=None)
         self.request_id     = request_id
-        self.member         = member
+        self.member_id      = member_id
         self.requested_role = requested_role
 
         approve_btn = discord.ui.Button(
@@ -220,6 +236,15 @@ class RequestCardView(discord.ui.View):
         )
         deny_btn.callback = self._deny
         self.add_item(deny_btn)
+
+    async def _get_member(self, guild: discord.Guild) -> discord.Member | None:
+        member = guild.get_member(self.member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(self.member_id)
+            except discord.NotFound:
+                pass
+        return member
 
     async def _check_authority(self, interaction: discord.Interaction) -> bool:
         guild    = interaction.guild
@@ -241,7 +266,7 @@ class RequestCardView(discord.ui.View):
             return
 
         guild  = interaction.guild
-        member = guild.get_member(self.member.id)
+        member = await self._get_member(guild)
         if member is None:
             await interaction.response.send_message(
                 "❌ Member not found in the server.", ephemeral=True
@@ -283,7 +308,7 @@ class RequestCardView(discord.ui.View):
         if not await self._check_authority(interaction):
             return
         await interaction.response.send_modal(
-            DenyModal(self.request_id, self.member, self.requested_role)
+            DenyModal(self.request_id, self.member_id, self.requested_role)
         )
 
 
@@ -300,13 +325,8 @@ class Roles(commands.Cog):
     async def _restore_views(self):
         await self.bot.wait_until_ready()
         for row in db.get_pending_role_requests():
-            guild = self.bot.get_guild(row["guild_id"])
-            if guild is None:
-                continue
-            member = guild.get_member(row["member_id"])
-            if member is None:
-                continue
-            view = RequestCardView(row["id"], member, row["requested_role"])
+            # No member lookup needed — view resolves member lazily on interaction.
+            view = RequestCardView(row["id"], row["member_id"], row["requested_role"])
             self.bot.add_view(view)
 
     @app_commands.command(
@@ -365,7 +385,7 @@ class Roles(commands.Cog):
             return
 
         embed = _request_embed(member, current_role, role)
-        view  = RequestCardView(req_id, member, role)
+        view  = RequestCardView(req_id, member.id, role)
         msg   = await approval_ch.send(embed=embed, view=view)
 
         db.set_request_message(req_id, msg.id, approval_ch.id)
