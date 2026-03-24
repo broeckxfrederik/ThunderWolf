@@ -321,3 +321,11 @@ def update_request_status(request_id: int, status: str) -> None:
         c.execute(
             "UPDATE role_requests SET status=? WHERE id=?", (status, request_id)
         )
+
+
+def get_pending_role_requests() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM role_requests WHERE status='pending' AND message_id IS NOT NULL"
+        ).fetchall()
+    return [dict(r) for r in rows]
