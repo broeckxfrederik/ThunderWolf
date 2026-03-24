@@ -319,6 +319,10 @@ class RaceEvent(commands.Cog):
 
     async def cog_load(self):
         """Restore LineupViews for all active events on bot (re)start."""
+        # Schedule view restoration after ready — don't block load_extension.
+        self.bot.loop.create_task(self._restore_views())
+
+    async def _restore_views(self):
         await self.bot.wait_until_ready()
         for guild in self.bot.guilds:
             for event in db.get_active_events(guild.id):
