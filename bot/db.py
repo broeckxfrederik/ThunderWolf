@@ -85,6 +85,16 @@ def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with _conn() as c:
         c.executescript(_DDL)
+        # Safe column migrations — ignored if the column already exists
+        existing = {row[1] for row in c.execute("PRAGMA table_info(events)")}
+        for col, definition in [
+            ("race_msg_id", "INTEGER"),
+            ("tm_ch_id",    "INTEGER"),
+            ("tm_msg_id",   "INTEGER"),
+            ("restricted",  "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            if col not in existing:
+                c.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
 
 
 # ── guild_config ──────────────────────────────────────────────────────────────
@@ -185,6 +195,24 @@ def set_event_channel(event_id: int, channel_id: int) -> None:
         c.execute("UPDATE events SET channel_id=? WHERE id=?", (channel_id, event_id))
 
 
+def set_event_messages(
+    event_id: int,
+    race_msg_id: int,
+    tm_ch_id: int,
+    tm_msg_id: int,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE events SET race_msg_id=?, tm_ch_id=?, tm_msg_id=? WHERE id=?",
+            (race_msg_id, tm_ch_id, tm_msg_id, event_id),
+        )
+
+
+def mark_restricted(event_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE events SET restricted=1 WHERE id=?", (event_id,))
+
+
 def get_event(event_id: int) -> dict | None:
     with _conn() as c:
         row = c.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
@@ -244,6 +272,22 @@ def mark_reminder(event_id: int, which: str) -> None:
 def mark_roles_cleaned(event_id: int) -> None:
     with _conn() as c:
         c.execute("UPDATE events SET roles_cleaned=1 WHERE id=?", (event_id,))
+
+
+def get_events_due_restriction(before_iso: str) -> list[dict]:
+    """Return confirmed events whose race time has passed and haven't been restricted yet."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM events WHERE confirmed=1 AND date_utc <= ? AND restricted=0",
+            (before_iso,),
+        ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["slots"]  = json.loads(d.pop("slots_json"))
+        d["lineup"] = json.loads(d.pop("lineup_json"))
+        out.append(d)
+    return out
 
 
 def get_events_due_cleanup(before_iso: str) -> list[dict]:

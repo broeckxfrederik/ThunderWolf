@@ -2,15 +2,23 @@
 Race Event cog
 ──────────────
 /event name:… date:YYYY-MM-DD time:HH:MM cars:…
-    Creates a dedicated #race-<name> channel under the Races category.
+    Creates a dedicated #race-<name> channel (visible to everyone).
+    Posts the lineup embed+buttons in both the race channel and
+    #team-manager-lineups.  Both messages stay in sync on every slot change.
+    Tags the Driver-Notification role on creation.
+
     Car names use autocomplete from the guild car list (see /car-add).
     Duplicate car names in the list create multiple slots (BMW #1, BMW #2, …).
 
     Lineup flow:
-      1. Drivers click a car-slot button → registered for that slot.
+      1. Drivers click a car-slot button in either channel → registered.
       2. TM reviews the draft and clicks ✅ Confirm Lineup.
-      3. Lineup locked, pinned embed updated, buttons disabled.
+      3. Lineup locked, both embeds updated, buttons disabled.
       4. TM can override before confirm via /lineup-set.
+
+    At race start time:
+      The background task restricts the race channel to confirmed drivers only
+      (+ CEO/TM). Unregistered members lose read access.
 
     Reminders:
       Background task fires T-24h and T-1h pings in the race channel.
@@ -33,7 +41,10 @@ import db
 from config import (
     ROLE_CEO, ROLE_TEAM_MANAGER,
     CFG_CAT_RACES, RACES_CATEGORY,
+    CFG_CH_LINEUP, CHANNEL_LINEUP,
+    CFG_ROLE_CEO, CFG_ROLE_TM,
     RACE_ROLE_PREFIX,
+    ROLE_DRIVER_NOTIF,
 )
 
 
@@ -52,7 +63,6 @@ def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
     Convert a list of car names (with possible duplicates) into slot dicts.
     Each slot: {car_id, car_name, slot_num, label}
     """
-    # count occurrences of each name
     name_counts: dict[str, int] = {}
     for n in car_names:
         name_counts[n] = name_counts.get(n, 0) + 1
@@ -62,7 +72,6 @@ def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
     for name in car_names:
         car = db.get_car_by_name(guild_id, name)
         if car is None:
-            # Auto-add unknown cars so autocomplete misses don't break the flow
             car_id = db.add_car(guild_id, name)
             car = {"id": car_id, "name": name}
 
@@ -94,6 +103,51 @@ async def _get_or_create_races_category(guild: discord.Guild) -> discord.Categor
     return cat
 
 
+async def _get_or_create_lineup_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Return the #team-manager-lineups channel, creating it if needed."""
+    raw_id = db.get_config(guild.id, CFG_CH_LINEUP)
+    if raw_id:
+        ch = guild.get_channel(int(raw_id))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+
+    ch = discord.utils.get(guild.text_channels, name=CHANNEL_LINEUP)
+    if ch:
+        db.set_config(guild.id, CFG_CH_LINEUP, str(ch.id))
+        return ch
+
+    # Create restricted to CEO/TM only
+    ceo_role = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+    tm_role  = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if ceo_role:
+        overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    if tm_role:
+        overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    try:
+        ch = await guild.create_text_channel(
+            CHANNEL_LINEUP,
+            overwrites=overwrites,
+            reason="Team manager lineups channel",
+        )
+        db.set_config(guild.id, CFG_CH_LINEUP, str(ch.id))
+        return ch
+    except discord.Forbidden:
+        return None
+
+
+def _resolve_cfg_role(guild: discord.Guild, cfg_key: str, fallback_name: str) -> discord.Role | None:
+    raw_id = db.get_config(guild.id, cfg_key)
+    if raw_id:
+        role = guild.get_role(int(raw_id))
+        if role:
+            return role
+    return discord.utils.get(guild.roles, name=fallback_name)
+
+
 async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
     """Remove Race-* roles from every driver registered in the given event."""
     event = db.get_event(event_id)
@@ -102,7 +156,6 @@ async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
     lineup: dict = event["lineup"]
     slots:  list = event["slots"]
 
-    # Collect the distinct car names used in this event
     car_names = {s["car_name"] for s in slots}
 
     for member_id in lineup.values():
@@ -119,7 +172,6 @@ async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
 
 
 def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
-    # Display format: "2026-03-28 20:00" (human-readable, space instead of T)
     date_str  = event["date_utc"].replace("T", " ")
     confirmed = event.get("confirmed", 0)
 
@@ -143,10 +195,44 @@ def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
     return embed
 
 
+async def _sync_other_message(
+    bot: discord.Client,
+    event: dict,
+    current_msg_id: int,
+    embed: discord.Embed,
+    view: discord.ui.View | None = None,
+) -> None:
+    """Edit whichever lineup message was NOT just interacted with."""
+    race_msg_id = event.get("race_msg_id")
+    tm_msg_id   = event.get("tm_msg_id")
+    tm_ch_id    = event.get("tm_ch_id")
+    race_ch_id  = event.get("channel_id")
+
+    if current_msg_id == race_msg_id and tm_msg_id and tm_ch_id:
+        ch = bot.get_channel(int(tm_ch_id))
+    elif current_msg_id == tm_msg_id and race_msg_id and race_ch_id:
+        ch = bot.get_channel(int(race_ch_id))
+    else:
+        return
+
+    if ch is None:
+        return
+    try:
+        msg = await ch.fetch_message(
+            int(tm_msg_id if current_msg_id == race_msg_id else race_msg_id)
+        )
+        if view is not None:
+            await msg.edit(embed=embed, view=view)
+        else:
+            await msg.edit(embed=embed)
+    except (discord.NotFound, discord.Forbidden):
+        pass
+
+
 # ── views ─────────────────────────────────────────────────────────────────────
 
 class LineupView(discord.ui.View):
-    """Car-slot buttons + TM confirm. Rebuilt from DB on bot restart via RaceEvent.restore_views()."""
+    """Car-slot buttons + TM confirm. Rebuilt from DB on bot restart."""
 
     def __init__(self, event_id: int, slots: list[dict], confirmed: bool = False):
         super().__init__(timeout=None)
@@ -170,12 +256,14 @@ class LineupView(discord.ui.View):
     async def _confirm_callback(self, interaction: discord.Interaction):
         member = interaction.user
         guild  = interaction.guild
-        tm_role  = guild.get_role(int(db.get_config(guild.id, "role_tm") or 0))
-        ceo_role = guild.get_role(int(db.get_config(guild.id, "role_ceo") or 0))
+        tm_role  = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+        ceo_role = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
 
-        has_tm  = tm_role  and tm_role  in member.roles
-        has_ceo = ceo_role and ceo_role in member.roles
-        if not (has_tm or has_ceo):
+        has_auth = (
+            (tm_role  and tm_role  in member.roles) or
+            (ceo_role and ceo_role in member.roles)
+        )
+        if not has_auth:
             await interaction.response.send_message(
                 "❌ Only Team Manager or CEO can confirm the lineup.", ephemeral=True
             )
@@ -184,7 +272,6 @@ class LineupView(discord.ui.View):
         db.confirm_event(self.event_id)
         event = db.get_event(self.event_id)
 
-        # Disable all buttons
         for child in self.children:
             child.disabled = True
         self.confirmed = True
@@ -192,7 +279,12 @@ class LineupView(discord.ui.View):
         embed = _lineup_embed(event, guild)
         await interaction.response.edit_message(embed=embed, view=self)
 
-        # Post a separate pinned confirmation message
+        # Sync the other channel's message
+        other_view = LineupView(self.event_id, event["slots"], confirmed=True)
+        await _sync_other_message(
+            interaction.client, event, interaction.message.id, embed, view=other_view
+        )
+
         confirm_msg = await interaction.channel.send(
             f"📌 **Lineup confirmed by {member.display_name}!**"
         )
@@ -244,7 +336,6 @@ class CarSlotButton(discord.ui.Button):
                 lineup.pop(k)
                 break
 
-        # Assign to new slot
         lineup[new_key] = member.id
         db.update_lineup(self.event_id, lineup)
 
@@ -255,9 +346,13 @@ class CarSlotButton(discord.ui.Button):
             race_role = await guild.create_role(name=role_name, reason="Race event role")
         await member.add_roles(race_role, reason=f"Registered for {self.slot['label']}")
 
-        # Update the lineup embed in-place
         embed = _lineup_embed(db.get_event(self.event_id), guild)
         await interaction.response.edit_message(embed=embed, view=self.view)
+
+        # Sync the other message
+        await _sync_other_message(
+            interaction.client, db.get_event(self.event_id), interaction.message.id, embed
+        )
 
 
 # ── results modal ─────────────────────────────────────────────────────────────
@@ -319,7 +414,6 @@ class RaceEvent(commands.Cog):
 
     async def cog_load(self):
         """Restore LineupViews for all active events on bot (re)start."""
-        # Schedule view restoration after ready — don't block load_extension.
         self.bot.loop.create_task(self._restore_views())
 
     async def _restore_views(self):
@@ -327,9 +421,6 @@ class RaceEvent(commands.Cog):
         for guild in self.bot.guilds:
             for event in db.get_active_events(guild.id):
                 if event["confirmed"] or event.get("channel_id") is None:
-                    continue
-                ch = self.bot.get_channel(event["channel_id"])
-                if ch is None:
                     continue
                 view = LineupView(event["id"], event["slots"], confirmed=False)
                 self.bot.add_view(view)
@@ -357,7 +448,6 @@ class RaceEvent(commands.Cog):
     ):
         guild = interaction.guild
 
-        # Parse and validate date/time
         try:
             dt = datetime.datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
         except ValueError:
@@ -376,21 +466,20 @@ class RaceEvent(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        slots     = _build_slots(guild.id, car_names)
-        date_str  = dt.strftime("%Y-%m-%dT%H:%M")
-        event_id  = db.create_event(guild.id, name, date_str, slots)
+        slots    = _build_slots(guild.id, car_names)
+        date_str = dt.strftime("%Y-%m-%dT%H:%M")
+        event_id = db.create_event(guild.id, name, date_str, slots)
 
-        # Create race channel
+        # Create race channel (visible to everyone)
         category = await _get_or_create_races_category(guild)
         safe_name = name.lower().replace(" ", "-")[:80]
-        channel = await guild.create_text_channel(
+        race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
             reason=f"Race event: {name}",
         )
-        db.set_event_channel(event_id, channel.id)
+        db.set_event_channel(event_id, race_channel.id)
 
-        # Post lineup embed + buttons
         event = db.get_event(event_id)
         view  = LineupView(event_id, slots)
         self.bot.add_view(view)
@@ -398,24 +487,47 @@ class RaceEvent(commands.Cog):
         embed = _lineup_embed(event, guild)
         embed.description = (
             f"📅 **{date_str} UTC**\n\n"
-            "Click your car slot to register. You can change your pick anytime until the lineup is confirmed."
+            "Click your car slot to register. You can change your pick until the lineup is confirmed."
         )
-        await channel.send(
+
+        # Ping Driver-Notification role
+        notif_role = discord.utils.get(guild.roles, name=ROLE_DRIVER_NOTIF)
+        ping_text  = notif_role.mention if notif_role else ""
+
+        race_msg = await race_channel.send(
             f"🏁 **Race Event: {name}**\n"
-            f"Organised by {interaction.user.mention}",
+            f"Organised by {interaction.user.mention} {ping_text}",
             embed=embed,
             view=view,
         )
 
+        # Post in #team-manager-lineups too
+        tm_ch  = await _get_or_create_lineup_channel(guild)
+        tm_msg = None
+        if tm_ch:
+            tm_view = LineupView(event_id, slots)
+            tm_msg  = await tm_ch.send(
+                f"📋 **Lineup draft — {name}** ({date_str} UTC)\n"
+                f"Race channel: {race_channel.mention}",
+                embed=embed,
+                view=tm_view,
+            )
+
+        db.set_event_messages(
+            event_id,
+            race_msg_id=race_msg.id,
+            tm_ch_id=tm_ch.id   if tm_ch  and tm_msg else 0,
+            tm_msg_id=tm_msg.id if tm_msg else 0,
+        )
+
         await interaction.followup.send(
-            f"✅ Race event **{name}** created: {channel.mention}", ephemeral=True
+            f"✅ Race event **{name}** created: {race_channel.mention}", ephemeral=True
         )
 
     @event.autocomplete("cars")
     async def cars_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete the last car name in a comma-separated string."""
         parts     = [p.strip() for p in current.split(",")]
         last_part = parts[-1]
         prefix    = ", ".join(parts[:-1])
@@ -446,7 +558,6 @@ class RaceEvent(commands.Cog):
         self, interaction: discord.Interaction, driver: discord.Member, slot: str
     ):
         guild = interaction.guild
-        # Find the active event for this channel
         event = self._event_for_channel(guild.id, interaction.channel_id)
         if event is None:
             await interaction.response.send_message(
@@ -472,7 +583,6 @@ class RaceEvent(commands.Cog):
         lineup  = event["lineup"]
         new_key = _slot_key(target_slot["car_id"], target_slot["slot_num"])
 
-        # Remove driver from any current slot
         for k, v in list(lineup.items()):
             if str(v) == str(driver.id):
                 lineup.pop(k)
@@ -509,11 +619,12 @@ class RaceEvent(commands.Cog):
                 return ev
         return None
 
-    # ── background: reminders ─────────────────────────────────────────────────
+    # ── background: reminders + restriction + cleanup ─────────────────────────
 
-    @tasks.loop(minutes=15)
+    @tasks.loop(minutes=5)
     async def reminder_task(self):
         now = datetime.datetime.utcnow()
+
         for guild in self.bot.guilds:
             for event in db.get_active_events(guild.id):
                 if event.get("channel_id") is None:
@@ -527,8 +638,8 @@ class RaceEvent(commands.Cog):
                 except ValueError:
                     continue
 
-                delta = race_dt - now
-                lineup: dict = event["lineup"]
+                delta  = race_dt - now
+                lineup = event["lineup"]
 
                 # T-24h reminder
                 if (
@@ -547,7 +658,7 @@ class RaceEvent(commands.Cog):
                     not event["reminder_1h_sent"]
                     and datetime.timedelta(minutes=45) <= delta <= datetime.timedelta(hours=1, minutes=15)
                 ):
-                    embed = _lineup_embed(event, guild)
+                    embed    = _lineup_embed(event, guild)
                     mentions = self._driver_mentions(guild, lineup)
                     await ch.send(
                         f"🚨 **1-hour reminder!** The race **{event['name']}** starts soon!\n"
@@ -556,13 +667,55 @@ class RaceEvent(commands.Cog):
                     )
                     db.mark_reminder(event["id"], "1h")
 
-        # 48h post-results: clean up Race-* roles
+        # At race start: restrict channel to confirmed drivers only
+        for event in db.get_events_due_restriction(now.isoformat()):
+            guild = self.bot.get_guild(event["guild_id"])
+            if guild is None:
+                continue
+            ch = self.bot.get_channel(event["channel_id"])
+            if ch is None:
+                db.mark_restricted(event["id"])
+                continue
+            await self._restrict_to_drivers(guild, ch, event)
+            db.mark_restricted(event["id"])
+
+        # 48h post-race: clean up Race-* roles
         cleanup_cutoff = (now - datetime.timedelta(hours=48)).isoformat()
         for event in db.get_events_due_cleanup(cleanup_cutoff):
             guild = self.bot.get_guild(event["guild_id"])
             if guild:
                 await _cleanup_race_roles(guild, event["id"])
                 db.mark_roles_cleaned(event["id"])
+
+    async def _restrict_to_drivers(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        event: dict,
+    ) -> None:
+        """Lock the race channel to confirmed lineup drivers + CEO/TM."""
+        lineup   = event["lineup"]
+        ceo_role = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+        tm_role  = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        if ceo_role:
+            overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        if tm_role:
+            overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        for member_id in lineup.values():
+            member = guild.get_member(int(member_id))
+            if member:
+                overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        try:
+            await channel.edit(overwrites=overwrites, reason="Race started — restricted to drivers")
+        except discord.Forbidden:
+            pass
 
     def _driver_mentions(self, guild: discord.Guild, lineup: dict) -> str:
         mentions = []
