@@ -4,6 +4,8 @@ services:
   discord-bot:
     build: .
     env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
     volumes:
       - ./data:/app/data
