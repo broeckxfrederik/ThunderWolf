@@ -18,11 +18,11 @@ from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
     WELCOME_CATEGORY, RACES_CATEGORY,
-    CHANNEL_ROLE_REQUESTS, CHANNEL_CAR_SETUPS, CHANNEL_LINEUP,
+    CHANNEL_ROLE_REQUESTS, CHANNEL_LINEUP,
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CAT_WELCOME, CFG_CAT_RACES,
-    CFG_CH_ROLE_REQ, CFG_CH_CAR_SETUPS, CFG_CH_LINEUP,
+    CFG_CH_ROLE_REQ, CFG_CH_LINEUP,
 )
 
 
@@ -41,7 +41,6 @@ STEPS: list[tuple[str, str, str, str]] = [
     (CFG_CAT_WELCOME,    "Welcome category",            "category",     WELCOME_CATEGORY),
     (CFG_CAT_RACES,      "Races category",              "category",     RACES_CATEGORY),
     (CFG_CH_ROLE_REQ,    "Role-requests channel",       "text_channel", CHANNEL_ROLE_REQUESTS),
-    (CFG_CH_CAR_SETUPS,  "Car-setups forum channel",    "forum",        CHANNEL_CAR_SETUPS),
     (CFG_CH_LINEUP,      "Team-manager lineups channel","text_channel", CHANNEL_LINEUP),
 ]
 

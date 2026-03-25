@@ -31,10 +31,9 @@ CREATE TABLE IF NOT EXISTS guild_config (
 );
 
 CREATE TABLE IF NOT EXISTS cars (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id        INTEGER NOT NULL,
-    name            TEXT    NOT NULL,
-    setup_thread_id INTEGER,
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    name     TEXT    NOT NULL,
     UNIQUE (guild_id, name)
 );
 
@@ -139,11 +138,6 @@ def add_car(guild_id: int, name: str) -> int:
     return row["id"]
 
 
-def set_car_thread(car_id: int, thread_id: int) -> None:
-    with _conn() as c:
-        c.execute("UPDATE cars SET setup_thread_id=? WHERE id=?", (thread_id, car_id))
-
-
 def remove_car(guild_id: int, name: str) -> bool:
     with _conn() as c:
         cur = c.execute(
@@ -155,7 +149,7 @@ def remove_car(guild_id: int, name: str) -> bool:
 def list_cars(guild_id: int) -> list[dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, name, setup_thread_id FROM cars WHERE guild_id=? ORDER BY name",
+            "SELECT id, name FROM cars WHERE guild_id=? ORDER BY name",
             (guild_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -173,7 +167,7 @@ def search_cars(guild_id: int, query: str, limit: int = 10) -> list[dict]:
 def get_car_by_name(guild_id: int, name: str) -> dict | None:
     with _conn() as c:
         row = c.execute(
-            "SELECT id, name, setup_thread_id FROM cars WHERE guild_id=? AND name=?",
+            "SELECT id, name FROM cars WHERE guild_id=? AND name=?",
             (guild_id, name),
         ).fetchone()
     return dict(row) if row else None
