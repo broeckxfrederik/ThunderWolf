@@ -32,7 +32,6 @@ RACES_CATEGORY          = "Races"
 CHANNEL_LINEUP          = "team-manager-lineups"
 CHANNEL_ROLE_REQUESTS   = "role-requests"
 CHANNEL_ROLE_APPROVALS  = "role-approvals"
-CHANNEL_CAR_SETUPS      = "car-setups"
 
 # ── Welcome timeout ───────────────────────────────────────────────────────────
 # Hours before a member who hasn't picked a role is kicked
@@ -52,5 +51,4 @@ CFG_CAT_WELCOME     = "category_welcome"
 CFG_CAT_RACES       = "category_races"
 CFG_CH_ROLE_REQ     = "channel_role_requests"
 CFG_CH_ROLE_APPROVALS = "channel_role_approvals"
-CFG_CH_CAR_SETUPS   = "channel_car_setups"
 CFG_CH_LINEUP       = "channel_lineup"
