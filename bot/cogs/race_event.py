@@ -616,6 +616,16 @@ class RaceEvent(commands.Cog):
             if role:
                 ch_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
+        # Unique car names known upfront — pre-create Race-<Car> roles so threads
+        # are immediately accessible to those roles (threads inherit channel overwrites)
+        unique_car_names = list(dict.fromkeys(s["car_name"] for s in slots))
+        for car_name in unique_car_names:
+            role_name  = f"{RACE_ROLE_PREFIX}{car_name}"
+            race_role  = discord.utils.get(guild.roles, name=role_name)
+            if race_role is None:
+                race_role = await guild.create_role(name=role_name, reason=f"Race event: {name}")
+            ch_overwrites[race_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
         race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
@@ -625,7 +635,6 @@ class RaceEvent(commands.Cog):
         db.set_event_channel(event_id, race_channel.id)
 
         # Create one discussion thread per unique car under the race channel
-        unique_car_names = list(dict.fromkeys(s["car_name"] for s in slots))
         for car_name in unique_car_names:
             try:
                 await race_channel.create_thread(
