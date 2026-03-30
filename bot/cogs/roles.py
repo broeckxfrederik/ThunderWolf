@@ -272,15 +272,6 @@ class RequestCardView(discord.ui.View):
         # easily exceed Discord's 3-second interaction response deadline.
         await interaction.response.defer()
 
-        member = await self._get_member(guild)
-        if member is None:
-            await interaction.followup.send("❌ Member not found in the server.", ephemeral=True)
-            return
-
-        # Defer now — the next steps involve multiple API calls which can
-        # easily exceed Discord's 3-second interaction response deadline.
-        await interaction.response.defer()
-
         try:
             member = await self._get_member(guild)
             if member is None:
@@ -324,9 +315,11 @@ class RequestCardView(discord.ui.View):
             embed = _request_embed(member, current_role, self.requested_role, "approved")
             await interaction.message.edit(embed=embed, view=None)
 
-        current_role = _current_team_role(member)
-        embed = _request_embed(member, current_role, self.requested_role, "approved")
-        await interaction.message.edit(embed=embed, view=None)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Unexpected error during approval: `{type(exc).__name__}: {exc}`",
+                ephemeral=True,
+            )
 
     async def _deny(self, interaction: discord.Interaction):
         if not await self._check_authority(interaction):
