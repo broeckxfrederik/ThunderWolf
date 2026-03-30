@@ -181,8 +181,7 @@ async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
             continue
         roles_to_remove = [
             r for r in member.roles
-            if r.name.startswith(RACE_ROLE_PREFIX)
-            and r.name[len(RACE_ROLE_PREFIX):] in car_names
+            if r.name in {f"{RACE_ROLE_PREFIX}{event_id}-{cn}" for cn in car_names}
         ]
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove, reason="Race event concluded")
@@ -332,12 +331,12 @@ class SlotSelect(discord.ui.Select):
         # Discord API calls outside the lock
         if old_slot_info:
             old_role = discord.utils.get(
-                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{self.event_id}-{old_slot_info['car_name']}"
             )
             if old_role and old_role in member.roles:
                 await member.remove_roles(old_role, reason="Changed slot")
 
-        role_name = f"{RACE_ROLE_PREFIX}{target_slot['car_name']}"
+        role_name = f"{RACE_ROLE_PREFIX}{self.event_id}-{target_slot['car_name']}"
         race_role = discord.utils.get(guild.roles, name=role_name)
         if race_role is None:
             race_role = await guild.create_role(name=role_name, reason="Race event role")
@@ -424,7 +423,7 @@ class LineupView(discord.ui.View):
 
         if old_slot_info:
             old_role = discord.utils.get(
-                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{self.event_id}-{old_slot_info['car_name']}"
             )
             if old_role and old_role in member.roles:
                 await member.remove_roles(old_role, reason="Withdrew from lineup")
@@ -616,6 +615,16 @@ class RaceEvent(commands.Cog):
             if role:
                 ch_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
+        # Unique car names known upfront — pre-create Race-<Car> roles so threads
+        # are immediately accessible to those roles (threads inherit channel overwrites)
+        unique_car_names = list(dict.fromkeys(s["car_name"] for s in slots))
+        for car_name in unique_car_names:
+            role_name  = f"{RACE_ROLE_PREFIX}{event_id}-{car_name}"
+            race_role  = discord.utils.get(guild.roles, name=role_name)
+            if race_role is None:
+                race_role = await guild.create_role(name=role_name, reason=f"Race event: {name}")
+            ch_overwrites[race_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
         race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
@@ -625,7 +634,6 @@ class RaceEvent(commands.Cog):
         db.set_event_channel(event_id, race_channel.id)
 
         # Create one discussion thread per unique car under the race channel
-        unique_car_names = list(dict.fromkeys(s["car_name"] for s in slots))
         for car_name in unique_car_names:
             try:
                 await race_channel.create_thread(
@@ -854,7 +862,7 @@ class RaceEvent(commands.Cog):
 
         if old_slot_info:
             old_role = discord.utils.get(
-                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{event['id']}-{old_slot_info['car_name']}"
             )
             if old_role and old_role in driver.roles:
                 await driver.remove_roles(old_role, reason="Removed from lineup by TM")
@@ -1041,7 +1049,7 @@ class RaceEvent(commands.Cog):
         car_names = list(dict.fromkeys(s["car_name"] for s in event["slots"]))
         mentions  = []
         for car_name in car_names:
-            role = discord.utils.get(guild.roles, name=f"{RACE_ROLE_PREFIX}{car_name}")
+            role = discord.utils.get(guild.roles, name=f"{RACE_ROLE_PREFIX}{event['id']}-{car_name}")
             if role:
                 mentions.append(role.mention)
         return " ".join(mentions) if mentions else ""
