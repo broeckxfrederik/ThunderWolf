@@ -1,35 +1,28 @@
 """
 Race Event cog
 ──────────────
-/event name:… date:YYYY-MM-DD time:HH:MM cars:…
+/event name:… date:YYYY-MM-DD time:HH:MM car1:… [car2..car6]
     Creates a dedicated #race-<name> channel (visible to everyone).
-    Posts the lineup embed+buttons in both the race channel and
-    #team-manager-lineups.  Both messages stay in sync on every slot change.
+    Posts the lineup embed + controls in both the race channel and
+    #team-manager-lineups.  Both messages stay in sync on every change.
     Tags the Driver-Notification role on creation.
 
-    Car names use autocomplete from the guild car list (see /car-add).
-    Duplicate car names in the list create multiple slots (BMW #1, BMW #2, …).
+    Lineup controls (on the embed):
+      • Dropdown "Select your slot" — drivers pick / switch their slot
+      • 🚪 Withdraw              — remove yourself from the lineup
+      • ✅ Confirm Lineup        — TM/CEO locks the lineup
 
-    Lineup flow:
-      1. Drivers click a car-slot button in either channel → registered.
-      2. TM reviews the draft and clicks ✅ Confirm Lineup.
-      3. Lineup locked, both embeds updated, buttons disabled.
-      4. TM can override before confirm via /lineup-set.
+    Background tasks:
+      • T-24h and T-1h reminders pinged in the race channel
+      • At race start: channel restricted to confirmed drivers + CEO/TM
+      • 48h after race: Race-* roles removed
 
-    At race start time:
-      The background task restricts the race channel to confirmed drivers only
-      (+ CEO/TM). Unregistered members lose read access.
-
-    Reminders:
-      Background task fires T-24h and T-1h pings in the race channel.
-
-/lineup-set driver:@user slot:…
-    Override a driver's slot before the lineup is confirmed (TM only).
-
-/event-result
-    Post a results embed in the current race channel (TM only).
+/lineup-set driver:@user slot:…   Override a driver's slot (TM/CEO, autocomplete)
+/lineup-remove driver:@user       Remove a driver from the lineup (TM/CEO)
+/event-result                     Post results embed in the race channel (TM/CEO)
 """
 
+import asyncio
 import datetime
 import json
 
@@ -46,6 +39,17 @@ from config import (
     RACE_ROLE_PREFIX,
     ROLE_DRIVER_NOTIF,
 )
+
+
+# ── race-condition guard ───────────────────────────────────────────────────────
+
+_lineup_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_lineup_lock(event_id: int) -> asyncio.Lock:
+    if event_id not in _lineup_locks:
+        _lineup_locks[event_id] = asyncio.Lock()
+    return _lineup_locks[event_id]
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -209,18 +213,18 @@ async def _sync_other_message(
     race_ch_id  = event.get("channel_id")
 
     if current_msg_id == race_msg_id and tm_msg_id and tm_ch_id:
-        ch = bot.get_channel(int(tm_ch_id))
+        ch     = bot.get_channel(int(tm_ch_id))
+        msg_id = int(tm_msg_id)
     elif current_msg_id == tm_msg_id and race_msg_id and race_ch_id:
-        ch = bot.get_channel(int(race_ch_id))
+        ch     = bot.get_channel(int(race_ch_id))
+        msg_id = int(race_msg_id)
     else:
         return
 
     if ch is None:
         return
     try:
-        msg = await ch.fetch_message(
-            int(tm_msg_id if current_msg_id == race_msg_id else race_msg_id)
-        )
+        msg = await ch.fetch_message(msg_id)
         if view is not None:
             await msg.edit(embed=embed, view=view)
         else:
@@ -231,37 +235,198 @@ async def _sync_other_message(
 
 # ── views ─────────────────────────────────────────────────────────────────────
 
-class LineupView(discord.ui.View):
-    """Car-slot buttons + TM confirm. Rebuilt from DB on bot restart."""
+class SlotSelect(discord.ui.Select):
+    """Dropdown for drivers to pick / switch their lineup slot."""
 
-    def __init__(self, event_id: int, slots: list[dict], confirmed: bool = False):
-        super().__init__(timeout=None)
-        self.event_id  = event_id
-        self.confirmed = confirmed
-
+    def __init__(self, event_id: int, slots: list[dict], lineup: dict, disabled: bool = False):
+        options = []
         for slot in slots:
-            btn = CarSlotButton(event_id, slot, disabled=confirmed)
-            self.add_item(btn)
+            key   = _slot_key(slot["car_id"], slot["slot_num"])
+            taken = key in lineup
+            options.append(discord.SelectOption(
+                label=slot["label"],
+                value=key,
+                description="🔴 Taken" if taken else "🟢 Available",
+            ))
+
+        super().__init__(
+            placeholder="🏎️  Select your slot…",
+            options=options,
+            custom_id=f"slot_select_{event_id}",
+            disabled=disabled,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        self.event_id = event_id
+        self.slots    = slots
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        selected_key = self.values[0]
+        member       = interaction.user
+        guild        = interaction.guild
+        old_slot_info   = None
+        target_slot     = None
+
+        async with _get_lineup_lock(self.event_id):
+            event = db.get_event(self.event_id)
+            if not event or event["confirmed"]:
+                await interaction.followup.send("❌ This event is no longer active.", ephemeral=True)
+                return
+
+            lineup = event["lineup"]
+
+            # Reject if the slot is taken by someone else
+            occupant = lineup.get(selected_key)
+            if occupant and str(occupant) != str(member.id):
+                await interaction.followup.send(
+                    "❌ That slot was just taken. Please pick another.", ephemeral=True
+                )
+                return
+
+            # Remove member from their current slot (if any)
+            for k, v in list(lineup.items()):
+                if str(v) == str(member.id):
+                    if k != selected_key:
+                        old_slot_info = next(
+                            (s for s in event["slots"]
+                             if _slot_key(s["car_id"], s["slot_num"]) == k),
+                            None,
+                        )
+                    lineup.pop(k)
+                    break
+
+            target_slot = next(
+                (s for s in self.slots
+                 if _slot_key(s["car_id"], s["slot_num"]) == selected_key),
+                None,
+            )
+            if not target_slot:
+                await interaction.followup.send("❌ Slot not found.", ephemeral=True)
+                return
+
+            lineup[selected_key] = member.id
+            db.update_lineup(self.event_id, lineup)
+
+        # Discord API calls outside the lock
+        if old_slot_info:
+            old_role = discord.utils.get(
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+            )
+            if old_role and old_role in member.roles:
+                await member.remove_roles(old_role, reason="Changed slot")
+
+        role_name = f"{RACE_ROLE_PREFIX}{target_slot['car_name']}"
+        race_role = discord.utils.get(guild.roles, name=role_name)
+        if race_role is None:
+            race_role = await guild.create_role(name=role_name, reason="Race event role")
+        await member.add_roles(race_role, reason=f"Registered for {target_slot['label']}")
+
+        event    = db.get_event(self.event_id)
+        embed    = _lineup_embed(event, guild)
+        new_view = LineupView(self.event_id, event["slots"], event["lineup"])
+        interaction.client.add_view(new_view)
+        await interaction.message.edit(embed=embed, view=new_view)
+        await _sync_other_message(
+            interaction.client, event, interaction.message.id, embed, view=new_view
+        )
+
+
+class LineupView(discord.ui.View):
+    """Slot selector + Withdraw + TM Confirm. Rebuilt from DB on restart."""
+
+    def __init__(
+        self,
+        event_id: int,
+        slots: list[dict],
+        lineup: dict,
+        confirmed: bool = False,
+    ):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+        self.slots    = slots
+
+        self.add_item(SlotSelect(event_id, slots, lineup, disabled=confirmed))
+
+        withdraw_btn = discord.ui.Button(
+            label="🚪 Withdraw",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"withdraw_{event_id}",
+            disabled=confirmed,
+            row=1,
+        )
+        withdraw_btn.callback = self._withdraw_callback
+        self.add_item(withdraw_btn)
 
         confirm_btn = discord.ui.Button(
             label="✅ Confirm Lineup",
             style=discord.ButtonStyle.success,
             custom_id=f"confirm_{event_id}",
-            row=4,
             disabled=confirmed,
+            row=1,
         )
         confirm_btn.callback = self._confirm_callback
         self.add_item(confirm_btn)
 
+    async def _withdraw_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        member        = interaction.user
+        guild         = interaction.guild
+        old_slot_info = None
+
+        async with _get_lineup_lock(self.event_id):
+            event = db.get_event(self.event_id)
+            if not event or event["confirmed"]:
+                await interaction.followup.send("❌ Lineup is already confirmed.", ephemeral=True)
+                return
+
+            lineup  = event["lineup"]
+            removed = False
+
+            for k, v in list(lineup.items()):
+                if str(v) == str(member.id):
+                    old_slot_info = next(
+                        (s for s in event["slots"]
+                         if _slot_key(s["car_id"], s["slot_num"]) == k),
+                        None,
+                    )
+                    lineup.pop(k)
+                    removed = True
+                    break
+
+            if not removed:
+                await interaction.followup.send("❌ You're not in the lineup.", ephemeral=True)
+                return
+
+            db.update_lineup(self.event_id, lineup)
+
+        if old_slot_info:
+            old_role = discord.utils.get(
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+            )
+            if old_role and old_role in member.roles:
+                await member.remove_roles(old_role, reason="Withdrew from lineup")
+
+        event    = db.get_event(self.event_id)
+        embed    = _lineup_embed(event, guild)
+        new_view = LineupView(self.event_id, event["slots"], event["lineup"])
+        interaction.client.add_view(new_view)
+        await interaction.message.edit(embed=embed, view=new_view)
+        await _sync_other_message(
+            interaction.client, event, interaction.message.id, embed, view=new_view
+        )
+
     async def _confirm_callback(self, interaction: discord.Interaction):
-        member = interaction.user
-        guild  = interaction.guild
+        guild    = interaction.guild
         tm_role  = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
         ceo_role = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
 
         has_auth = (
-            (tm_role  and tm_role  in member.roles) or
-            (ceo_role and ceo_role in member.roles)
+            (tm_role  and tm_role  in interaction.user.roles) or
+            (ceo_role and ceo_role in interaction.user.roles)
         )
         if not has_auth:
             await interaction.response.send_message(
@@ -274,85 +439,22 @@ class LineupView(discord.ui.View):
 
         for child in self.children:
             child.disabled = True
-        self.confirmed = True
 
         embed = _lineup_embed(event, guild)
         await interaction.response.edit_message(embed=embed, view=self)
 
-        # Sync the other channel's message
-        other_view = LineupView(self.event_id, event["slots"], confirmed=True)
+        other_view = LineupView(self.event_id, event["slots"], event["lineup"], confirmed=True)
         await _sync_other_message(
             interaction.client, event, interaction.message.id, embed, view=other_view
         )
 
         confirm_msg = await interaction.channel.send(
-            f"📌 **Lineup confirmed by {member.display_name}!**"
+            f"📌 **Lineup confirmed by {interaction.user.display_name}!**"
         )
         try:
             await confirm_msg.pin()
         except discord.Forbidden:
             pass
-
-
-class CarSlotButton(discord.ui.Button):
-    def __init__(self, event_id: int, slot: dict, disabled: bool = False):
-        super().__init__(
-            label=slot["label"],
-            style=discord.ButtonStyle.primary,
-            custom_id=f"slot_{event_id}_{slot['car_id']}_{slot['slot_num']}",
-            disabled=disabled,
-        )
-        self.event_id = event_id
-        self.slot     = slot
-
-    async def callback(self, interaction: discord.Interaction):
-        member = interaction.user
-        guild  = interaction.guild
-
-        event = db.get_event(self.event_id)
-        if event is None or event["confirmed"]:
-            await interaction.response.send_message(
-                "❌ This event is no longer active.", ephemeral=True
-            )
-            return
-
-        lineup = event["lineup"]
-        new_key = _slot_key(self.slot["car_id"], self.slot["slot_num"])
-
-        # Remove member from any existing slot
-        for k, v in list(lineup.items()):
-            if str(v) == str(member.id):
-                old_slot = next(
-                    (s for s in event["slots"]
-                     if _slot_key(s["car_id"], s["slot_num"]) == k),
-                    None,
-                )
-                if old_slot:
-                    old_role = discord.utils.get(
-                        guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot['car_name']}"
-                    )
-                    if old_role and old_role in member.roles:
-                        await member.remove_roles(old_role, reason="Changed slot")
-                lineup.pop(k)
-                break
-
-        lineup[new_key] = member.id
-        db.update_lineup(self.event_id, lineup)
-
-        # Assign race role
-        role_name = f"{RACE_ROLE_PREFIX}{self.slot['car_name']}"
-        race_role = discord.utils.get(guild.roles, name=role_name)
-        if race_role is None:
-            race_role = await guild.create_role(name=role_name, reason="Race event role")
-        await member.add_roles(race_role, reason=f"Registered for {self.slot['label']}")
-
-        embed = _lineup_embed(db.get_event(self.event_id), guild)
-        await interaction.response.edit_message(embed=embed, view=self.view)
-
-        # Sync the other message
-        await _sync_other_message(
-            interaction.client, db.get_event(self.event_id), interaction.message.id, embed
-        )
 
 
 # ── results modal ─────────────────────────────────────────────────────────────
@@ -422,7 +524,9 @@ class RaceEvent(commands.Cog):
             for event in db.get_active_events(guild.id):
                 if event["confirmed"] or event.get("channel_id") is None:
                     continue
-                view = LineupView(event["id"], event["slots"], confirmed=False)
+                view = LineupView(
+                    event["id"], event["slots"], event["lineup"], confirmed=False
+                )
                 self.bot.add_view(view)
 
     # ── /event ────────────────────────────────────────────────────────────────
@@ -435,7 +539,12 @@ class RaceEvent(commands.Cog):
         name="Race name (e.g. Monza Round 1)",
         date="Race date — YYYY-MM-DD",
         time="Race time UTC — HH:MM",
-        cars="Comma-separated car names (use autocomplete). Repeat a name for multiple slots.",
+        car1="First car (required)",
+        car2="Second car",
+        car3="Third car",
+        car4="Fourth car",
+        car5="Fifth car",
+        car6="Sixth car",
     )
     @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
     async def event(
@@ -444,7 +553,12 @@ class RaceEvent(commands.Cog):
         name: str,
         date: str,
         time: str,
-        cars: str,
+        car1: str,
+        car2: str | None = None,
+        car3: str | None = None,
+        car4: str | None = None,
+        car5: str | None = None,
+        car6: str | None = None,
     ):
         guild = interaction.guild
 
@@ -457,22 +571,16 @@ class RaceEvent(commands.Cog):
             )
             return
 
-        car_names = [c.strip() for c in cars.split(",") if c.strip()]
-        if not car_names:
-            await interaction.response.send_message(
-                "❌ Please provide at least one car.", ephemeral=True
-            )
-            return
-
+        car_names = [c.strip() for c in [car1, car2, car3, car4, car5, car6] if c]
         await interaction.response.defer(ephemeral=True)
 
         slots    = _build_slots(guild.id, car_names)
         date_str = dt.strftime("%Y-%m-%dT%H:%M")
         event_id = db.create_event(guild.id, name, date_str, slots)
 
-        # Create race channel (visible to everyone)
-        category = await _get_or_create_races_category(guild)
-        safe_name = name.lower().replace(" ", "-")[:80]
+        # Create race channel
+        category     = await _get_or_create_races_category(guild)
+        safe_name    = name.lower().replace(" ", "-")[:80]
         race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
@@ -481,16 +589,16 @@ class RaceEvent(commands.Cog):
         db.set_event_channel(event_id, race_channel.id)
 
         event = db.get_event(event_id)
-        view  = LineupView(event_id, slots)
+        view  = LineupView(event_id, slots, event["lineup"])
         self.bot.add_view(view)
 
         embed = _lineup_embed(event, guild)
         embed.description = (
             f"📅 **{date_str} UTC**\n\n"
-            "Click your car slot to register. You can change your pick until the lineup is confirmed."
+            "Use the dropdown to register for a slot. "
+            "You can change your pick until the lineup is confirmed."
         )
 
-        # Ping Driver-Notification role
         notif_role = discord.utils.get(guild.roles, name=ROLE_DRIVER_NOTIF)
         ping_text  = notif_role.mention if notif_role else ""
 
@@ -501,11 +609,10 @@ class RaceEvent(commands.Cog):
             view=view,
         )
 
-        # Post in #team-manager-lineups too
         tm_ch  = await _get_or_create_lineup_channel(guild)
         tm_msg = None
         if tm_ch:
-            tm_view = LineupView(event_id, slots)
+            tm_view = LineupView(event_id, slots, event["lineup"])
             tm_msg  = await tm_ch.send(
                 f"📋 **Lineup draft — {name}** ({date_str} UTC)\n"
                 f"Race channel: {race_channel.mention}",
@@ -524,34 +631,27 @@ class RaceEvent(commands.Cog):
             f"✅ Race event **{name}** created: {race_channel.mention}", ephemeral=True
         )
 
-    @event.autocomplete("cars")
-    async def cars_autocomplete(
+    @event.autocomplete("car1")
+    @event.autocomplete("car2")
+    @event.autocomplete("car3")
+    @event.autocomplete("car4")
+    @event.autocomplete("car5")
+    @event.autocomplete("car6")
+    async def car_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        parts     = [p.strip() for p in current.split(",")]
-        last_part = parts[-1]
-        prefix    = ", ".join(parts[:-1])
-        if prefix:
-            prefix += ", "
-
-        matches = db.search_cars(interaction.guild_id, last_part, limit=10)
-        return [
-            app_commands.Choice(
-                name=prefix + m["name"],
-                value=prefix + m["name"],
-            )
-            for m in matches
-        ]
+        matches = db.search_cars(interaction.guild_id, current, limit=10)
+        return [app_commands.Choice(name=m["name"], value=m["name"]) for m in matches]
 
     # ── /lineup-set ───────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="lineup-set",
-        description="Override a driver's slot before the lineup is confirmed (TM / CEO only).",
+        description="Place a driver in a specific slot (TM / CEO only).",
     )
     @app_commands.describe(
         driver="The driver to place",
-        slot="Slot label exactly as shown in the lineup (e.g. 'BMW M4 GT3 #2')",
+        slot="Slot to assign — pick from the list (shows current occupant)",
     )
     @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
     async def lineup_set(
@@ -576,23 +676,108 @@ class RaceEvent(commands.Cog):
         if target_slot is None:
             slot_names = ", ".join(f'"{s["label"]}"' for s in event["slots"])
             await interaction.response.send_message(
-                f"❌ Slot not found. Available slots: {slot_names}", ephemeral=True
+                f"❌ Slot not found. Available: {slot_names}", ephemeral=True
             )
             return
 
-        lineup  = event["lineup"]
-        new_key = _slot_key(target_slot["car_id"], target_slot["slot_num"])
+        async with _get_lineup_lock(event["id"]):
+            event   = db.get_event(event["id"])
+            lineup  = event["lineup"]
+            new_key = _slot_key(target_slot["car_id"], target_slot["slot_num"])
 
-        for k, v in list(lineup.items()):
-            if str(v) == str(driver.id):
-                lineup.pop(k)
-                break
+            for k, v in list(lineup.items()):
+                if str(v) == str(driver.id):
+                    lineup.pop(k)
+                    break
 
-        lineup[new_key] = driver.id
-        db.update_lineup(event["id"], lineup)
+            lineup[new_key] = driver.id
+            db.update_lineup(event["id"], lineup)
 
         await interaction.response.send_message(
             f"✅ {driver.mention} placed in **{target_slot['label']}**.", ephemeral=True
+        )
+
+    @lineup_set.autocomplete("slot")
+    async def lineup_set_slot_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        event = self._event_for_channel(interaction.guild_id, interaction.channel_id)
+        if event is None:
+            return []
+
+        lineup  = event["lineup"]
+        choices = []
+        for slot in event["slots"]:
+            if current.lower() not in slot["label"].lower():
+                continue
+            key = _slot_key(slot["car_id"], slot["slot_num"])
+            mid = lineup.get(key)
+            if mid:
+                member = interaction.guild.get_member(int(mid))
+                desc   = f"Driver: {member.display_name}" if member else "Driver: (unknown)"
+            else:
+                desc = "Empty"
+            choices.append(app_commands.Choice(
+                name=f"{slot['label']} — {desc}",
+                value=slot["label"],
+            ))
+        return choices[:25]
+
+    # ── /lineup-remove ────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="lineup-remove",
+        description="Remove a driver from the lineup (TM / CEO only).",
+    )
+    @app_commands.describe(driver="The driver to remove")
+    @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
+    async def lineup_remove(self, interaction: discord.Interaction, driver: discord.Member):
+        guild = interaction.guild
+        event = self._event_for_channel(guild.id, interaction.channel_id)
+        if event is None:
+            await interaction.response.send_message(
+                "❌ No active event found for this channel.", ephemeral=True
+            )
+            return
+        if event["confirmed"]:
+            await interaction.response.send_message(
+                "❌ Lineup is already confirmed.", ephemeral=True
+            )
+            return
+
+        old_slot_info = None
+
+        async with _get_lineup_lock(event["id"]):
+            event  = db.get_event(event["id"])
+            lineup = event["lineup"]
+
+            for k, v in list(lineup.items()):
+                if str(v) == str(driver.id):
+                    old_slot_info = next(
+                        (s for s in event["slots"]
+                         if _slot_key(s["car_id"], s["slot_num"]) == k),
+                        None,
+                    )
+                    lineup.pop(k)
+                    break
+
+            if old_slot_info is None:
+                await interaction.response.send_message(
+                    f"❌ {driver.mention} is not in the lineup.", ephemeral=True
+                )
+                return
+
+            db.update_lineup(event["id"], lineup)
+
+        if old_slot_info:
+            old_role = discord.utils.get(
+                guild.roles, name=f"{RACE_ROLE_PREFIX}{old_slot_info['car_name']}"
+            )
+            if old_role and old_role in driver.roles:
+                await driver.remove_roles(old_role, reason="Removed from lineup by TM")
+
+        await interaction.response.send_message(
+            f"✅ {driver.mention} removed from **{old_slot_info['label']}**.", ephemeral=True
         )
 
     # ── /event-result ─────────────────────────────────────────────────────────
@@ -733,6 +918,7 @@ class RaceEvent(commands.Cog):
 
     @event.error
     @lineup_set.error
+    @lineup_remove.error
     @event_result.error
     async def event_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingAnyRole):
