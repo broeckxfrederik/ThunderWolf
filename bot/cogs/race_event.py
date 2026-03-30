@@ -601,9 +601,21 @@ class RaceEvent(commands.Cog):
         date_str = dt.strftime("%Y-%m-%dT%H:%M")
         event_id = db.create_event(guild.id, name, date_str, slots)
 
-        # Create race channel
-        category     = await _get_or_create_races_category(guild)
-        safe_name    = name.lower().replace(" ", "-")[:80]
+        # Create race channel — visible to Driver, Driver-Notification, CEO, TM; hidden from @everyone
+        category       = await _get_or_create_races_category(guild)
+        safe_name      = name.lower().replace(" ", "-")[:80]
+        driver_role    = _resolve_cfg_role(guild, CFG_ROLE_DRIVER, ROLE_DRIVER)
+        notif_role_ch  = discord.utils.get(guild.roles, name=ROLE_DRIVER_NOTIF)
+        ceo_role_ch    = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+        tm_role_ch     = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+        ch_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        for role in (driver_role, notif_role_ch, ceo_role_ch, tm_role_ch):
+            if role:
+                ch_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
         race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
