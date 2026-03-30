@@ -31,6 +31,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import db
+from utils import resolve_role as _resolve_cfg_role
 from config import (
     ROLE_CEO, ROLE_TEAM_MANAGER,
     CFG_CAT_RACES, RACES_CATEGORY,
@@ -66,7 +67,16 @@ def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
     """
     Convert a list of car names (with possible duplicates) into slot dicts.
     Each slot: {car_id, car_name, slot_num, label}
+    Raises ValueError listing unknown names if any car is not in the DB.
     """
+    unknown = [n for n in car_names if db.get_car_by_name(guild_id, n) is None]
+    if unknown:
+        known = [c["name"] for c in db.list_cars(guild_id)]
+        known_str = ", ".join(f"**{n}**" for n in known) if known else "*(none yet — use /car-add)*"
+        raise ValueError(
+            f"Unknown car(s): {', '.join(unknown)}\nRegistered cars: {known_str}"
+        )
+
     name_counts: dict[str, int] = {}
     for n in car_names:
         name_counts[n] = name_counts.get(n, 0) + 1
@@ -75,10 +85,6 @@ def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
     slots = []
     for name in car_names:
         car = db.get_car_by_name(guild_id, name)
-        if car is None:
-            car_id = db.add_car(guild_id, name)
-            car = {"id": car_id, "name": name}
-
         name_seen[name] = name_seen.get(name, 0) + 1
         snum  = name_seen[name]
         total = name_counts[name]
@@ -141,15 +147,6 @@ async def _get_or_create_lineup_channel(guild: discord.Guild) -> discord.TextCha
         return ch
     except discord.Forbidden:
         return None
-
-
-def _resolve_cfg_role(guild: discord.Guild, cfg_key: str, fallback_name: str) -> discord.Role | None:
-    raw_id = db.get_config(guild.id, cfg_key)
-    if raw_id:
-        role = guild.get_role(int(raw_id))
-        if role:
-            return role
-    return discord.utils.get(guild.roles, name=fallback_name)
 
 
 async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
@@ -435,6 +432,7 @@ class LineupView(discord.ui.View):
             return
 
         db.confirm_event(self.event_id)
+        _lineup_locks.pop(self.event_id, None)
         event = db.get_event(self.event_id)
 
         for child in self.children:
@@ -477,12 +475,11 @@ class ResultsModal(discord.ui.Modal, title="Post Race Results"):
         self.event_id = event_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        import datetime as _dt
         results = {
             "positions": self.positions.value,
             "notes":     self.notes.value or "",
         }
-        db.set_results(self.event_id, results, _dt.datetime.utcnow().isoformat())
+        db.set_results(self.event_id, results, datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat())
 
         embed = discord.Embed(
             title="🏆 Race Results",
@@ -574,7 +571,11 @@ class RaceEvent(commands.Cog):
         car_names = [c.strip() for c in [car1, car2, car3, car4, car5, car6] if c]
         await interaction.response.defer(ephemeral=True)
 
-        slots    = _build_slots(guild.id, car_names)
+        try:
+            slots = _build_slots(guild.id, car_names)
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
         date_str = dt.strftime("%Y-%m-%dT%H:%M")
         event_id = db.create_event(guild.id, name, date_str, slots)
 
@@ -780,6 +781,45 @@ class RaceEvent(commands.Cog):
             f"✅ {driver.mention} removed from **{old_slot_info['label']}**.", ephemeral=True
         )
 
+    # ── /event-cancel ─────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="event-cancel",
+        description="Cancel this race event, remove Race-* roles, and optionally delete the channel (TM / CEO).",
+    )
+    @app_commands.describe(delete_channel="Delete the race channel after cancelling? (default: yes)")
+    @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
+    async def event_cancel(
+        self,
+        interaction: discord.Interaction,
+        delete_channel: bool = True,
+    ):
+        guild = interaction.guild
+        event = self._event_for_channel(guild.id, interaction.channel_id)
+        if event is None:
+            await interaction.response.send_message(
+                "❌ No active event found for this channel.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Clean up Race-* roles for all registered drivers
+        await _cleanup_race_roles(guild, event["id"])
+
+        db.cancel_event(event["id"])
+        _lineup_locks.pop(event["id"], None)
+
+        await interaction.followup.send(
+            f"✅ **{event['name']}** has been cancelled and Race-* roles removed.",
+            ephemeral=True,
+        )
+
+        if delete_channel:
+            ch = guild.get_channel(event["channel_id"])
+            if ch:
+                await ch.delete(reason=f"Event cancelled by {interaction.user.display_name}")
+
     # ── /event-result ─────────────────────────────────────────────────────────
 
     @app_commands.command(
@@ -799,16 +839,22 @@ class RaceEvent(commands.Cog):
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _event_for_channel(self, guild_id: int, channel_id: int) -> dict | None:
+        """Return the active event whose race channel OR TM lineup channel matches."""
         for ev in db.get_active_events(guild_id):
             if ev.get("channel_id") == channel_id:
                 return ev
+            if ev.get("tm_ch_id") and ev.get("tm_msg_id"):
+                # Also match if the command is run from the TM lineups channel
+                tm_ch_id = ev.get("tm_ch_id")
+                if tm_ch_id and int(tm_ch_id) == channel_id:
+                    return ev
         return None
 
     # ── background: reminders + restriction + cleanup ─────────────────────────
 
     @tasks.loop(minutes=5)
     async def reminder_task(self):
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
         for guild in self.bot.guilds:
             for event in db.get_active_events(guild.id):
@@ -878,7 +924,10 @@ class RaceEvent(commands.Cog):
         channel: discord.TextChannel,
         event: dict,
     ) -> None:
-        """Lock the race channel to confirmed lineup drivers + CEO/TM."""
+        """Send a warning, then lock the race channel to confirmed lineup drivers + CEO/TM."""
+        await channel.send(
+            "🔒 **Race has started.** This channel is now restricted to confirmed drivers."
+        )
         lineup   = event["lineup"]
         ceo_role = _resolve_cfg_role(guild, CFG_ROLE_CEO, ROLE_CEO)
         tm_role  = _resolve_cfg_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
@@ -919,6 +968,7 @@ class RaceEvent(commands.Cog):
     @event.error
     @lineup_set.error
     @lineup_remove.error
+    @event_cancel.error
     @event_result.error
     async def event_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingAnyRole):

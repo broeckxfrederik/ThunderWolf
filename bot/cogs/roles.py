@@ -18,6 +18,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+from utils import resolve_role as _resolve_role
 from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_F1, ROLE_TWITCH, ROLE_DRIVER_NOTIF,
@@ -53,15 +54,6 @@ ROLE_CHOICES = [
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def _resolve_role(guild: discord.Guild, cfg_key: str, fallback_name: str) -> discord.Role | None:
-    raw_id = db.get_config(guild.id, cfg_key)
-    if raw_id:
-        role = guild.get_role(int(raw_id))
-        if role:
-            return role
-    return discord.utils.get(guild.roles, name=fallback_name)
-
 
 def _current_team_role(member: discord.Member) -> str:
     """Return the member's current team role name, or 'None'."""
