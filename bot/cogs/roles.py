@@ -262,15 +262,27 @@ class RequestCardView(discord.ui.View):
         return has_auth
 
     async def _approve(self, interaction: discord.Interaction):
-        if not await self._check_authority(interaction):
+        # Auth check is synchronous — respond immediately if unauthorized
+        guild    = interaction.guild
+        ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+        tm_role  = _resolve_role(guild, CFG_ROLE_TM,  ROLE_TEAM_MANAGER)
+        has_auth = (
+            (ceo_role and ceo_role in interaction.user.roles) or
+            (tm_role  and tm_role  in interaction.user.roles)
+        )
+        if not has_auth:
+            await interaction.response.send_message(
+                "❌ Only CEO or Team Manager can approve/deny role requests.", ephemeral=True
+            )
             return
 
-        guild  = interaction.guild
+        # Defer now — the next steps involve multiple API calls which can
+        # easily exceed Discord's 3-second interaction response deadline.
+        await interaction.response.defer()
+
         member = await self._get_member(guild)
         if member is None:
-            await interaction.response.send_message(
-                "❌ Member not found in the server.", ephemeral=True
-            )
+            await interaction.followup.send("❌ Member not found in the server.", ephemeral=True)
             return
 
         # Remove all current team roles
@@ -302,7 +314,7 @@ class RequestCardView(discord.ui.View):
 
         current_role = _current_team_role(member)
         embed = _request_embed(member, current_role, self.requested_role, "approved")
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.message.edit(embed=embed, view=None)
 
     async def _deny(self, interaction: discord.Interaction):
         if not await self._check_authority(interaction):
