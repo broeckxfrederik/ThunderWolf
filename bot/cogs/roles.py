@@ -277,32 +277,52 @@ class RequestCardView(discord.ui.View):
             await interaction.followup.send("❌ Member not found in the server.", ephemeral=True)
             return
 
-        # Remove all current team roles
-        for cfg_key, fallback in TEAM_ROLES:
-            role = _resolve_role(guild, cfg_key, fallback)
-            if role and role in member.roles:
-                await member.remove_roles(role, reason="Role request approved")
-
-        # Find and assign the requested role
-        new_role = discord.utils.get(guild.roles, name=self.requested_role)
-        if new_role is None:
-            for cfg_key, fallback in TEAM_ROLES:
-                if fallback == self.requested_role:
-                    new_role = _resolve_role(guild, cfg_key, fallback)
-                    break
-
-        if new_role:
-            await member.add_roles(new_role, reason="Role request approved")
-
-        db.update_request_status(self.request_id, "approved")
+        # Defer now — the next steps involve multiple API calls which can
+        # easily exceed Discord's 3-second interaction response deadline.
+        await interaction.response.defer()
 
         try:
-            await member.send(
-                f"✅ Your request for the **{self.requested_role}** role was **approved**! "
-                "Your role has been updated."
-            )
-        except discord.Forbidden:
-            pass
+            member = await self._get_member(guild)
+            if member is None:
+                await interaction.followup.send("❌ Member not found in the server.", ephemeral=True)
+                return
+
+            # Find the requested role first — fail early if it doesn't exist
+            new_role = discord.utils.get(guild.roles, name=self.requested_role)
+            if new_role is None:
+                for cfg_key, fallback in TEAM_ROLES:
+                    if fallback == self.requested_role:
+                        new_role = _resolve_role(guild, cfg_key, fallback)
+                        break
+
+            if new_role is None:
+                await interaction.followup.send(
+                    f"❌ Role **{self.requested_role}** not found on this server. "
+                    "Ask a CEO/TM to run `/setup` to link it first.",
+                    ephemeral=True,
+                )
+                return
+
+            # Remove all current team roles
+            for cfg_key, fallback in TEAM_ROLES:
+                role = _resolve_role(guild, cfg_key, fallback)
+                if role and role in member.roles:
+                    await member.remove_roles(role, reason="Role request approved")
+
+            await member.add_roles(new_role, reason="Role request approved")
+            db.update_request_status(self.request_id, "approved")
+
+            try:
+                await member.send(
+                    f"✅ Your request for the **{self.requested_role}** role was **approved**! "
+                    "Your role has been updated."
+                )
+            except discord.Forbidden:
+                pass
+
+            current_role = _current_team_role(member)
+            embed = _request_embed(member, current_role, self.requested_role, "approved")
+            await interaction.message.edit(embed=embed, view=None)
 
         current_role = _current_team_role(member)
         embed = _request_embed(member, current_role, self.requested_role, "approved")

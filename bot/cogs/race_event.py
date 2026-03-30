@@ -33,10 +33,10 @@ from discord.ext import commands, tasks
 import db
 from utils import resolve_role as _resolve_cfg_role
 from config import (
-    ROLE_CEO, ROLE_TEAM_MANAGER,
+    ROLE_CEO, ROLE_TEAM_MANAGER, ROLE_DRIVER,
     CFG_CAT_RACES, RACES_CATEGORY,
     CFG_CH_LINEUP, CHANNEL_LINEUP,
-    CFG_ROLE_CEO, CFG_ROLE_TM,
+    CFG_ROLE_CEO, CFG_ROLE_TM, CFG_ROLE_DRIVER,
     RACE_ROLE_PREFIX,
     ROLE_DRIVER_NOTIF,
 )
@@ -61,6 +61,17 @@ def _slot_key(car_id: int, slot_num: int) -> str:
 
 def _slot_label(car_name: str, count: int, slot_num: int) -> str:
     return f"{car_name} #{slot_num}" if count > 1 else car_name
+
+
+def _normalize_lineup(lineup: dict) -> dict:
+    """Ensure lineup values are always lists of int member IDs (backward compat)."""
+    normalized = {}
+    for k, v in lineup.items():
+        if isinstance(v, list):
+            normalized[k] = [int(x) for x in v]
+        else:
+            normalized[k] = [int(v)]
+    return normalized
 
 
 def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
@@ -154,13 +165,18 @@ async def _cleanup_race_roles(guild: discord.Guild, event_id: int) -> None:
     event = db.get_event(event_id)
     if not event:
         return
-    lineup: dict = event["lineup"]
+    lineup = _normalize_lineup(event["lineup"])
     slots:  list = event["slots"]
 
     car_names = {s["car_name"] for s in slots}
 
-    for member_id in lineup.values():
-        member = guild.get_member(int(member_id))
+    # Flatten to a set of all member IDs
+    all_member_ids: set[int] = set()
+    for occupants in lineup.values():
+        all_member_ids.update(occupants)
+
+    for member_id in all_member_ids:
+        member = guild.get_member(member_id)
         if not member:
             continue
         roles_to_remove = [
@@ -183,14 +199,20 @@ def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
     )
     embed.set_footer(text="✅ Lineup confirmed" if confirmed else "⏳ Lineup pending TM confirmation")
 
-    lineup: dict = event["lineup"]
+    lineup = _normalize_lineup(event["lineup"])
     slots:  list = event["slots"]
 
     for slot in slots:
-        key    = _slot_key(slot["car_id"], slot["slot_num"])
-        mid    = lineup.get(key)
-        member = guild.get_member(int(mid)) if mid else None
-        driver = member.display_name if member else "*open*"
+        key      = _slot_key(slot["car_id"], slot["slot_num"])
+        occupants = lineup.get(key, [])
+        if occupants:
+            names = []
+            for mid in occupants:
+                m = guild.get_member(mid)
+                names.append(m.display_name if m else f"<{mid}>")
+            driver = ", ".join(names)
+        else:
+            driver = "*open*"
         embed.add_field(name=slot["label"], value=driver, inline=True)
 
     return embed
@@ -585,9 +607,23 @@ class RaceEvent(commands.Cog):
         race_channel = await guild.create_text_channel(
             name=f"race-{safe_name}",
             category=category,
+            overwrites=ch_overwrites,
             reason=f"Race event: {name}",
         )
         db.set_event_channel(event_id, race_channel.id)
+
+        # Create one discussion thread per unique car under the race channel
+        unique_car_names = list(dict.fromkeys(s["car_name"] for s in slots))
+        for car_name in unique_car_names:
+            try:
+                await race_channel.create_thread(
+                    name=f"{car_name} — setup & strategy",
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=10080,  # 7 days
+                    reason=f"Car thread: {car_name}",
+                )
+            except discord.Forbidden:
+                pass
 
         event = db.get_event(event_id)
         view  = LineupView(event_id, slots, event["lineup"])
@@ -695,7 +731,41 @@ class RaceEvent(commands.Cog):
             db.update_lineup(event["id"], lineup)
 
         await interaction.response.send_message(
-            f"✅ {driver.mention} placed in **{target_slot['label']}**.", ephemeral=True
+            f"✅ {driver.mention} removed from **{old_slot_info['label']}**.", ephemeral=True
+        )
+
+    # ── /event-cancel ─────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="event-cancel",
+        description="Cancel this race event, remove Race-* roles, and optionally delete the channel (TM / CEO).",
+    )
+    @app_commands.describe(delete_channel="Delete the race channel after cancelling? (default: yes)")
+    @app_commands.checks.has_any_role(ROLE_CEO, ROLE_TEAM_MANAGER)
+    async def event_cancel(
+        self,
+        interaction: discord.Interaction,
+        delete_channel: bool = True,
+    ):
+        guild = interaction.guild
+        event = self._event_for_channel(guild.id, interaction.channel_id)
+        if event is None:
+            await interaction.response.send_message(
+                "❌ No active event found for this channel.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Clean up Race-* roles for all registered drivers
+        await _cleanup_race_roles(guild, event["id"])
+
+        db.cancel_event(event["id"])
+        _lineup_locks.pop(event["id"], None)
+
+        await interaction.followup.send(
+            f"✅ **{event['name']}** has been cancelled and Race-* roles removed.",
+            ephemeral=True,
         )
 
     @lineup_set.autocomplete("slot")
@@ -869,15 +939,14 @@ class RaceEvent(commands.Cog):
                 except ValueError:
                     continue
 
-                delta  = race_dt - now
-                lineup = event["lineup"]
+                delta = race_dt - now
 
                 # T-24h reminder
                 if (
                     not event["reminder_24h_sent"]
                     and datetime.timedelta(hours=23, minutes=45) <= delta <= datetime.timedelta(hours=24, minutes=15)
                 ):
-                    mentions = self._driver_mentions(guild, lineup)
+                    mentions = self._driver_mentions(guild, event)
                     await ch.send(
                         f"⏰ **24-hour reminder!** The race **{event['name']}** starts in ~24h.\n"
                         f"{mentions}"
@@ -890,7 +959,7 @@ class RaceEvent(commands.Cog):
                     and datetime.timedelta(minutes=45) <= delta <= datetime.timedelta(hours=1, minutes=15)
                 ):
                     embed    = _lineup_embed(event, guild)
-                    mentions = self._driver_mentions(guild, lineup)
+                    mentions = self._driver_mentions(guild, event)
                     await ch.send(
                         f"🚨 **1-hour reminder!** The race **{event['name']}** starts soon!\n"
                         f"{mentions}",
@@ -941,8 +1010,12 @@ class RaceEvent(commands.Cog):
         if tm_role:
             overwrites[tm_role]  = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-        for member_id in lineup.values():
-            member = guild.get_member(int(member_id))
+        all_member_ids: set[int] = set()
+        for occupants in lineup.values():
+            all_member_ids.update(occupants)
+
+        for member_id in all_member_ids:
+            member = guild.get_member(member_id)
             if member:
                 overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
@@ -951,13 +1024,15 @@ class RaceEvent(commands.Cog):
         except discord.Forbidden:
             pass
 
-    def _driver_mentions(self, guild: discord.Guild, lineup: dict) -> str:
-        mentions = []
-        for member_id in lineup.values():
-            m = guild.get_member(int(member_id))
-            if m:
-                mentions.append(m.mention)
-        return " ".join(mentions) if mentions else "*No drivers registered yet.*"
+    def _driver_mentions(self, guild: discord.Guild, event: dict) -> str:
+        """Return @mentions of Race-<Car> roles for this event (one ping per car name)."""
+        car_names = list(dict.fromkeys(s["car_name"] for s in event["slots"]))
+        mentions  = []
+        for car_name in car_names:
+            role = discord.utils.get(guild.roles, name=f"{RACE_ROLE_PREFIX}{car_name}")
+            if role:
+                mentions.append(role.mention)
+        return " ".join(mentions) if mentions else ""
 
     @reminder_task.before_loop
     async def before_reminder(self):
