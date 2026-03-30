@@ -91,6 +91,7 @@ def init_db() -> None:
             ("tm_ch_id",    "INTEGER"),
             ("tm_msg_id",   "INTEGER"),
             ("restricted",  "INTEGER NOT NULL DEFAULT 0"),
+            ("cancelled",   "INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing:
                 c.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
@@ -219,11 +220,19 @@ def get_event(event_id: int) -> dict | None:
     return d
 
 
+def cancel_event(event_id: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE events SET cancelled=1, roles_cleaned=1 WHERE id=?",
+            (event_id,),
+        )
+
+
 def get_active_events(guild_id: int) -> list[dict]:
-    """Return confirmed=0 and past-deadline events that haven't finished."""
+    """Return non-cancelled events for a guild."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM events WHERE guild_id=? ORDER BY date_utc",
+            "SELECT * FROM events WHERE guild_id=? AND cancelled=0 ORDER BY date_utc",
             (guild_id,),
         ).fetchall()
     out = []
