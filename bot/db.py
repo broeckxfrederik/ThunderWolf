@@ -31,10 +31,9 @@ CREATE TABLE IF NOT EXISTS guild_config (
 );
 
 CREATE TABLE IF NOT EXISTS cars (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id        INTEGER NOT NULL,
-    name            TEXT    NOT NULL,
-    setup_thread_id INTEGER,
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    name     TEXT    NOT NULL,
     UNIQUE (guild_id, name)
 );
 
@@ -92,6 +91,7 @@ def init_db() -> None:
             ("tm_ch_id",    "INTEGER"),
             ("tm_msg_id",   "INTEGER"),
             ("restricted",  "INTEGER NOT NULL DEFAULT 0"),
+            ("cancelled",   "INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing:
                 c.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
@@ -139,11 +139,6 @@ def add_car(guild_id: int, name: str) -> int:
     return row["id"]
 
 
-def set_car_thread(car_id: int, thread_id: int) -> None:
-    with _conn() as c:
-        c.execute("UPDATE cars SET setup_thread_id=? WHERE id=?", (thread_id, car_id))
-
-
 def remove_car(guild_id: int, name: str) -> bool:
     with _conn() as c:
         cur = c.execute(
@@ -155,7 +150,7 @@ def remove_car(guild_id: int, name: str) -> bool:
 def list_cars(guild_id: int) -> list[dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, name, setup_thread_id FROM cars WHERE guild_id=? ORDER BY name",
+            "SELECT id, name FROM cars WHERE guild_id=? ORDER BY name",
             (guild_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -173,7 +168,7 @@ def search_cars(guild_id: int, query: str, limit: int = 10) -> list[dict]:
 def get_car_by_name(guild_id: int, name: str) -> dict | None:
     with _conn() as c:
         row = c.execute(
-            "SELECT id, name, setup_thread_id FROM cars WHERE guild_id=? AND name=?",
+            "SELECT id, name FROM cars WHERE guild_id=? AND name=?",
             (guild_id, name),
         ).fetchone()
     return dict(row) if row else None
@@ -225,11 +220,19 @@ def get_event(event_id: int) -> dict | None:
     return d
 
 
+def cancel_event(event_id: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE events SET cancelled=1, roles_cleaned=1 WHERE id=?",
+            (event_id,),
+        )
+
+
 def get_active_events(guild_id: int) -> list[dict]:
-    """Return confirmed=0 and past-deadline events that haven't finished."""
+    """Return non-cancelled events for a guild."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM events WHERE guild_id=? ORDER BY date_utc",
+            "SELECT * FROM events WHERE guild_id=? AND cancelled=0 ORDER BY date_utc",
             (guild_id,),
         ).fetchall()
     out = []

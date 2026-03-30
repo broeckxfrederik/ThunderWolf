@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import db
+from utils import resolve_role as _resolve_role
 from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
@@ -32,15 +33,6 @@ from config import (
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def _resolve_role(guild: discord.Guild, cfg_key: str, fallback_name: str) -> discord.Role | None:
-    raw_id = db.get_config(guild.id, cfg_key)
-    if raw_id:
-        role = guild.get_role(int(raw_id))
-        if role:
-            return role
-    return discord.utils.get(guild.roles, name=fallback_name)
-
 
 async def _get_or_create_welcome_category(guild: discord.Guild) -> discord.CategoryChannel:
     raw_id = db.get_config(guild.id, CFG_CAT_WELCOME)
@@ -198,7 +190,7 @@ class Greeting(commands.Cog):
             channel_id=channel.id,
             guild_id=guild.id,
             member_id=member.id,
-            created_at=datetime.datetime.utcnow().isoformat(),
+            created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
     # ── background: 12h kick for non-responders ───────────────────────────────
@@ -206,7 +198,7 @@ class Greeting(commands.Cog):
     @tasks.loop(minutes=30)
     async def check_welcome_channels(self):
         cutoff = (
-            datetime.datetime.utcnow() - datetime.timedelta(hours=WELCOME_TIMEOUT_HOURS)
+            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=WELCOME_TIMEOUT_HOURS)
         ).isoformat()
         expired = db.get_expired_welcomes(cutoff)
 

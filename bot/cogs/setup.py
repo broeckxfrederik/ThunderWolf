@@ -18,11 +18,11 @@ from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
     WELCOME_CATEGORY, RACES_CATEGORY,
-    CHANNEL_ROLE_REQUESTS, CHANNEL_CAR_SETUPS, CHANNEL_LINEUP,
+    CHANNEL_ROLE_REQUESTS, CHANNEL_ROLE_APPROVALS, CHANNEL_LINEUP,
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CAT_WELCOME, CFG_CAT_RACES,
-    CFG_CH_ROLE_REQ, CFG_CH_CAR_SETUPS, CFG_CH_LINEUP,
+    CFG_CH_ROLE_REQ, CFG_CH_ROLE_APPROVALS, CFG_CH_LINEUP,
 )
 
 
@@ -40,9 +40,9 @@ STEPS: list[tuple[str, str, str, str]] = [
     (CFG_ROLE_TM,        "Team Manager role",           "role",         ROLE_TEAM_MANAGER),
     (CFG_CAT_WELCOME,    "Welcome category",            "category",     WELCOME_CATEGORY),
     (CFG_CAT_RACES,      "Races category",              "category",     RACES_CATEGORY),
-    (CFG_CH_ROLE_REQ,    "Role-requests channel",       "text_channel", CHANNEL_ROLE_REQUESTS),
-    (CFG_CH_CAR_SETUPS,  "Car-setups forum channel",    "forum",        CHANNEL_CAR_SETUPS),
-    (CFG_CH_LINEUP,      "Team-manager lineups channel","text_channel", CHANNEL_LINEUP),
+    (CFG_CH_ROLE_REQ,      "Role-requests channel",        "text_channel", CHANNEL_ROLE_REQUESTS),
+    (CFG_CH_ROLE_APPROVALS,"Role-approvals channel",       "text_channel", CHANNEL_ROLE_APPROVALS),
+    (CFG_CH_LINEUP,        "Team-manager lineups channel", "text_channel", CHANNEL_LINEUP),
 ]
 
 
@@ -192,6 +192,14 @@ def _status_lines(guild: discord.Guild, cfg: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def _is_ceo_or_owner(interaction: discord.Interaction) -> bool:
+    """Allow server owner to bypass the CEO role check (needed on first-run)."""
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+    ceo_role = discord.utils.get(interaction.guild.roles, name=ROLE_CEO)
+    return bool(ceo_role and ceo_role in interaction.user.roles)
+
+
 # ── cog ───────────────────────────────────────────────────────────────────────
 
 class Setup(commands.Cog):
@@ -200,10 +208,14 @@ class Setup(commands.Cog):
 
     @app_commands.command(
         name="setup",
-        description="(CEO only) Configure roles and channels for ThunderWolf.",
+        description="(CEO / server owner) Configure roles and channels for ThunderWolf.",
     )
-    @app_commands.checks.has_any_role(ROLE_CEO)
     async def setup(self, interaction: discord.Interaction):
+        if not _is_ceo_or_owner(interaction):
+            await interaction.response.send_message(
+                "❌ Only the CEO or server owner can run `/setup`.", ephemeral=True
+            )
+            return
         view = SetupView(interaction.guild, step=0)
         await interaction.response.send_message(
             _step_prompt(0),
@@ -220,15 +232,6 @@ class Setup(commands.Cog):
         cfg = db.get_all_config(interaction.guild_id)
         text = _status_lines(interaction.guild, cfg)
         await interaction.response.send_message(text, ephemeral=True)
-
-    @setup.error
-    async def setup_error(self, interaction: discord.Interaction, error):
-        if isinstance(error, app_commands.MissingAnyRole):
-            await interaction.response.send_message(
-                "❌ Only the CEO can run `/setup`.", ephemeral=True
-            )
-        else:
-            raise error
 
     @setup_status.error
     async def setup_status_error(self, interaction: discord.Interaction, error):
