@@ -257,14 +257,16 @@ class SlotSelect(discord.ui.Select):
     """Dropdown for drivers to pick / switch their lineup slot."""
 
     def __init__(self, event_id: int, slots: list[dict], lineup: dict, disabled: bool = False):
+        norm    = _normalize_lineup(lineup)
         options = []
         for slot in slots:
-            key   = _slot_key(slot["car_id"], slot["slot_num"])
-            taken = key in lineup
+            key       = _slot_key(slot["car_id"], slot["slot_num"])
+            occupants = norm.get(key, [])
+            desc      = f"👥 {len(occupants)} driver(s) signed up" if occupants else "🟢 Open"
             options.append(discord.SelectOption(
                 label=slot["label"],
                 value=key,
-                description="🔴 Taken" if taken else "🟢 Available",
+                description=desc,
             ))
 
         super().__init__(
@@ -294,26 +296,26 @@ class SlotSelect(discord.ui.Select):
                 await interaction.followup.send("❌ This event is no longer active.", ephemeral=True)
                 return
 
-            lineup = event["lineup"]
+            lineup = _normalize_lineup(event["lineup"])
 
-            # Reject if the slot is taken by someone else
-            occupant = lineup.get(selected_key)
-            if occupant and str(occupant) != str(member.id):
-                await interaction.followup.send(
-                    "❌ That slot was just taken. Please pick another.", ephemeral=True
-                )
-                return
-
-            # Remove member from their current slot (if any)
-            for k, v in list(lineup.items()):
-                if str(v) == str(member.id):
-                    if k != selected_key:
-                        old_slot_info = next(
-                            (s for s in event["slots"]
-                             if _slot_key(s["car_id"], s["slot_num"]) == k),
-                            None,
+            # Move member out of their current slot if switching
+            for k, occupants in list(lineup.items()):
+                if member.id in occupants:
+                    if k == selected_key:
+                        await interaction.followup.send(
+                            "You're already signed up for that slot.", ephemeral=True
                         )
-                    lineup.pop(k)
+                        return
+                    old_slot_info = next(
+                        (s for s in event["slots"]
+                         if _slot_key(s["car_id"], s["slot_num"]) == k),
+                        None,
+                    )
+                    occupants.remove(member.id)
+                    if not occupants:
+                        lineup.pop(k)
+                    else:
+                        lineup[k] = occupants
                     break
 
             target_slot = next(
@@ -325,7 +327,10 @@ class SlotSelect(discord.ui.Select):
                 await interaction.followup.send("❌ Slot not found.", ephemeral=True)
                 return
 
-            lineup[selected_key] = member.id
+            # Multiple drivers per slot allowed
+            if selected_key not in lineup:
+                lineup[selected_key] = []
+            lineup[selected_key].append(member.id)
             db.update_lineup(self.event_id, lineup)
 
         # Discord API calls outside the lock
@@ -401,17 +406,21 @@ class LineupView(discord.ui.View):
                 await interaction.followup.send("❌ Lineup is already confirmed.", ephemeral=True)
                 return
 
-            lineup  = event["lineup"]
+            lineup  = _normalize_lineup(event["lineup"])
             removed = False
 
-            for k, v in list(lineup.items()):
-                if str(v) == str(member.id):
+            for k, occupants in list(lineup.items()):
+                if member.id in occupants:
                     old_slot_info = next(
                         (s for s in event["slots"]
                          if _slot_key(s["car_id"], s["slot_num"]) == k),
                         None,
                     )
-                    lineup.pop(k)
+                    occupants.remove(member.id)
+                    if not occupants:
+                        lineup.pop(k)
+                    else:
+                        lineup[k] = occupants
                     removed = True
                     break
 
@@ -739,19 +748,26 @@ class RaceEvent(commands.Cog):
 
         async with _get_lineup_lock(event["id"]):
             event   = db.get_event(event["id"])
-            lineup  = event["lineup"]
+            lineup  = _normalize_lineup(event["lineup"])
             new_key = _slot_key(target_slot["car_id"], target_slot["slot_num"])
 
-            for k, v in list(lineup.items()):
-                if str(v) == str(driver.id):
-                    lineup.pop(k)
+            for k, occupants in list(lineup.items()):
+                if driver.id in occupants:
+                    occupants.remove(driver.id)
+                    if not occupants:
+                        lineup.pop(k)
+                    else:
+                        lineup[k] = occupants
                     break
 
-            lineup[new_key] = driver.id
+            if new_key not in lineup:
+                lineup[new_key] = []
+            if driver.id not in lineup[new_key]:
+                lineup[new_key].append(driver.id)
             db.update_lineup(event["id"], lineup)
 
         await interaction.response.send_message(
-            f"✅ {driver.mention} removed from **{old_slot_info['label']}**.", ephemeral=True
+            f"✅ {driver.mention} placed in **{target_slot['label']}**.", ephemeral=True
         )
 
     # ── /event-cancel ─────────────────────────────────────────────────────────
@@ -796,16 +812,19 @@ class RaceEvent(commands.Cog):
         if event is None:
             return []
 
-        lineup  = event["lineup"]
+        lineup  = _normalize_lineup(event["lineup"])
         choices = []
         for slot in event["slots"]:
-            if current.lower() not in slot["label"].lower():
+            if current and current.lower() not in slot["label"].lower():
                 continue
-            key = _slot_key(slot["car_id"], slot["slot_num"])
-            mid = lineup.get(key)
-            if mid:
-                member = interaction.guild.get_member(int(mid))
-                desc   = f"Driver: {member.display_name}" if member else "Driver: (unknown)"
+            key       = _slot_key(slot["car_id"], slot["slot_num"])
+            occupants = lineup.get(key, [])
+            if occupants:
+                names = []
+                for mid in occupants:
+                    m = interaction.guild.get_member(mid)
+                    names.append(m.display_name if m else str(mid))
+                desc = f"Drivers: {', '.join(names)}"
             else:
                 desc = "Empty"
             choices.append(app_commands.Choice(
@@ -840,16 +859,20 @@ class RaceEvent(commands.Cog):
 
         async with _get_lineup_lock(event["id"]):
             event  = db.get_event(event["id"])
-            lineup = event["lineup"]
+            lineup = _normalize_lineup(event["lineup"])
 
-            for k, v in list(lineup.items()):
-                if str(v) == str(driver.id):
+            for k, occupants in list(lineup.items()):
+                if driver.id in occupants:
                     old_slot_info = next(
                         (s for s in event["slots"]
                          if _slot_key(s["car_id"], s["slot_num"]) == k),
                         None,
                     )
-                    lineup.pop(k)
+                    occupants.remove(driver.id)
+                    if not occupants:
+                        lineup.pop(k)
+                    else:
+                        lineup[k] = occupants
                     break
 
             if old_slot_info is None:
