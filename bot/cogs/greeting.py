@@ -22,6 +22,12 @@ from discord.ext import commands, tasks
 
 import db
 from utils import resolve_role as _resolve_role
+from cogs.roles import (
+    _get_role_approvals_channel,
+    _request_embed,
+    _current_team_role,
+    RequestCardView,
+)
 from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
@@ -92,10 +98,7 @@ class JoinView(discord.ui.View):
             )
             return
 
-        role = _resolve_role(self.member.guild, cfg_key, fallback_name)
-        if role:
-            await self.member.add_roles(role, reason=f"Welcome role pick: {label}")
-
+        # Respond immediately — role assignment must not block the Discord response
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
@@ -104,7 +107,60 @@ class JoinView(discord.ui.View):
         )
         self.stop()
 
-        # Remove from DB and delete the channel after a brief pause
+        role = _resolve_role(self.member.guild, cfg_key, fallback_name)
+        if role:
+            try:
+                await self.member.add_roles(role, reason=f"Welcome role pick: {label}")
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"⚠️ Could not assign the **{label}** role — missing permissions. "
+                    "Please ask a TM/CEO to assign it manually.",
+                    ephemeral=True,
+                )
+
+        db.remove_welcome(self.channel.id)
+        await asyncio.sleep(5)
+        try:
+            await self.channel.delete(reason="Welcome flow complete")
+        except discord.NotFound:
+            pass
+
+    async def _request_pick(
+        self,
+        interaction: discord.Interaction,
+        fallback_name: str,
+        label: str,
+    ):
+        """Respond immediately then create a role-request card for TM/CEO approval."""
+        if interaction.user.id != self.member.id:
+            await interaction.response.send_message(
+                "This welcome is not for you.", ephemeral=True
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=(
+                f"📋 Your request for **{label}** has been submitted! "
+                "A team manager will review it shortly."
+            ),
+            view=self,
+        )
+        self.stop()
+
+        guild  = self.member.guild
+        req_id = db.create_role_request(guild.id, self.member.id, fallback_name)
+
+        approvals_ch = await _get_role_approvals_channel(guild)
+        if approvals_ch:
+            current = _current_team_role(self.member)
+            embed   = _request_embed(self.member, current, fallback_name, "pending")
+            view    = RequestCardView(req_id, self.member.id, fallback_name)
+            msg     = await approvals_ch.send(embed=embed, view=view)
+            interaction.client.add_view(view)
+            db.set_request_message(req_id, msg.id, approvals_ch.id)
+
         db.remove_welcome(self.channel.id)
         await asyncio.sleep(5)
         try:
@@ -118,11 +174,11 @@ class JoinView(discord.ui.View):
 
     @discord.ui.button(label="🔧 Engineer",         style=discord.ButtonStyle.primary)
     async def btn_engineer(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._pick(interaction, CFG_ROLE_ENGINEER, ROLE_ENGINEER, "Engineer")
+        await self._request_pick(interaction, ROLE_ENGINEER, "Engineer")
 
     @discord.ui.button(label="🎨 Livery Designer",  style=discord.ButtonStyle.primary)
     async def btn_livery(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._pick(interaction, CFG_ROLE_LIVERY, ROLE_LIVERY, "Livery Designer")
+        await self._request_pick(interaction, ROLE_LIVERY, "Livery Designer")
 
     @discord.ui.button(label="👀 Just Visiting",    style=discord.ButtonStyle.secondary, row=1)
     async def btn_visitor(self, interaction: discord.Interaction, _: discord.ui.Button):
