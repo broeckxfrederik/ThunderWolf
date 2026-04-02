@@ -645,11 +645,16 @@ class RaceEvent(commands.Cog):
         # Create one discussion thread per unique car under the race channel
         for car_name in unique_car_names:
             try:
-                await race_channel.create_thread(
+                thread = await race_channel.create_thread(
                     name=f"{car_name} — setup & strategy",
                     type=discord.ChannelType.public_thread,
                     auto_archive_duration=10080,  # 7 days
                     reason=f"Car thread: {car_name}",
+                )
+                await thread.send(
+                    f"🏎️ **{car_name}** — {name}\n"
+                    f"📅 {date_str.replace('T', ' ')} UTC\n\n"
+                    "Use this thread for setup notes, strategy, and anything car-specific."
                 )
             except discord.Forbidden:
                 pass
