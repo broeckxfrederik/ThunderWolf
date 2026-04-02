@@ -74,6 +74,13 @@ def _normalize_lineup(lineup: dict) -> dict:
     return normalized
 
 
+def _discord_timestamp(date_utc: str) -> str:
+    """Convert a naive UTC ISO string (YYYY-MM-DDTHH:MM) to a Discord <t:UNIX:F> tag."""
+    dt   = datetime.datetime.fromisoformat(date_utc)
+    unix = int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+    return f"<t:{unix}:F>"
+
+
 def _build_slots(guild_id: int, car_names: list[str]) -> list[dict]:
     """
     Convert a list of car names (with possible duplicates) into slot dicts.
@@ -193,7 +200,7 @@ def _lineup_embed(event: dict, guild: discord.Guild) -> discord.Embed:
 
     embed = discord.Embed(
         title=f"🏁 {event['name']}",
-        description=f"📅 {date_str} UTC",
+        description=f"📅 {date_str} UTC\n{_discord_timestamp(event['date_utc'])}",
         colour=discord.Colour.green() if confirmed else discord.Colour.orange(),
     )
     embed.set_footer(text="✅ Lineup confirmed" if confirmed else "⏳ Lineup pending TM confirmation")
@@ -653,7 +660,7 @@ class RaceEvent(commands.Cog):
                 )
                 await thread.send(
                     f"🏎️ **{car_name}** — {name}\n"
-                    f"📅 {date_str.replace('T', ' ')} UTC\n\n"
+                    f"📅 {date_str.replace('T', ' ')} UTC\n{_discord_timestamp(date_str)}\n\n"
                     "Use this thread for setup notes, strategy, and anything car-specific."
                 )
             except discord.Forbidden:
@@ -665,7 +672,7 @@ class RaceEvent(commands.Cog):
 
         embed = _lineup_embed(event, guild)
         embed.description = (
-            f"📅 **{date_str} UTC**\n\n"
+            f"📅 **{date_str} UTC**\n{_discord_timestamp(date_str)}\n\n"
             "Use the dropdown to register for a slot. "
             "You can change your pick until the lineup is confirmed."
         )
@@ -686,6 +693,7 @@ class RaceEvent(commands.Cog):
             tm_view = LineupView(event_id, slots, event["lineup"])
             tm_msg  = await tm_ch.send(
                 f"📋 **Lineup draft — {name}** ({date_str} UTC)\n"
+                f"{_discord_timestamp(date_str)}\n"
                 f"Race channel: {race_channel.mention}",
                 embed=embed,
                 view=tm_view,
@@ -997,6 +1005,7 @@ class RaceEvent(commands.Cog):
                     mentions = self._driver_mentions(guild, event)
                     await ch.send(
                         f"⏰ **24-hour reminder!** The race **{event['name']}** starts in ~24h.\n"
+                        f"{_discord_timestamp(event['date_utc'])}\n"
                         f"{mentions}"
                     )
                     db.mark_reminder(event["id"], "24h")
@@ -1010,6 +1019,7 @@ class RaceEvent(commands.Cog):
                     mentions = self._driver_mentions(guild, event)
                     await ch.send(
                         f"🚨 **1-hour reminder!** The race **{event['name']}** starts soon!\n"
+                        f"{_discord_timestamp(event['date_utc'])}\n"
                         f"{mentions}",
                         embed=embed,
                     )
