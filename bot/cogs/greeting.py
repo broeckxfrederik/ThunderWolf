@@ -7,8 +7,8 @@ Greeting cog
 • Member picks their role via buttons:
     Driver | Engineer | Livery Designer | Visitor | Updates Only
 • On pick: role assigned instantly, channel deleted after a short pause.
-• If no pick within 12 hours: member is kicked, channel deleted.
-  State is persisted in SQLite so the timeout survives bot restarts.
+• If no pick: a reminder is sent every 7 days until the member picks.
+  State is persisted in SQLite so the reminder schedule survives bot restarts.
 
 /test-welcome  — manually trigger the flow for a user (CEO / TM only).
 """
@@ -34,7 +34,7 @@ from config import (
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CAT_WELCOME, WELCOME_CATEGORY,
-    WELCOME_TIMEOUT_HOURS,
+    WELCOME_REMINDER_DAYS,
 )
 
 
@@ -237,8 +237,8 @@ class Greeting(commands.Cog):
         await channel.send(
             f"👋 Hey {member.mention}, welcome to **{guild.name}**!\n\n"
             "Pick the role that best describes you below.\n"
-            "This channel will be removed automatically after you pick "
-            f"(or in {WELCOME_TIMEOUT_HOURS}h if you don't).",
+            "This channel will be removed automatically after you pick. "
+            "We'll remind you every 7 days until you do.",
             view=view,
         )
 
@@ -249,17 +249,16 @@ class Greeting(commands.Cog):
             created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
-    # ── background: 12h kick for non-responders ───────────────────────────────
+    # ── background: 7-day reminder for non-responders ────────────────────────
 
-    @tasks.loop(minutes=30)
+    @tasks.loop(hours=6)
     async def check_welcome_channels(self):
-        cutoff = (
-            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=WELCOME_TIMEOUT_HOURS)
-        ).isoformat()
-        expired = db.get_expired_welcomes(cutoff)
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        cutoff = (now - datetime.timedelta(days=WELCOME_REMINDER_DAYS)).isoformat()
+        to_remind = db.get_welcomes_to_remind(cutoff)
 
-        for row in expired:
-            guild   = self.bot.get_guild(row["guild_id"])
+        for row in to_remind:
+            guild = self.bot.get_guild(row["guild_id"])
             if guild is None:
                 db.remove_welcome(row["channel_id"])
                 continue
@@ -267,21 +266,27 @@ class Greeting(commands.Cog):
             member  = guild.get_member(row["member_id"])
             channel = self.bot.get_channel(row["channel_id"])
 
-            if member:
-                try:
-                    await member.kick(
-                        reason=f"Did not pick a role within {WELCOME_TIMEOUT_HOURS}h."
-                    )
-                except discord.Forbidden:
-                    pass
+            if member is None:
+                # Member left — clean up the welcome record and channel
+                if channel:
+                    try:
+                        await channel.delete(reason="Member left the server.")
+                    except discord.NotFound:
+                        pass
+                db.remove_welcome(row["channel_id"])
+                continue
 
             if channel:
                 try:
-                    await channel.delete(reason="Welcome timed out.")
-                except discord.NotFound:
+                    await channel.send(
+                        f"👋 {member.mention} — just a reminder to pick your role! "
+                        "Use the buttons in the message above to get started, "
+                        "or use `/role-request` if the buttons no longer respond."
+                    )
+                except (discord.NotFound, discord.Forbidden):
                     pass
 
-            db.remove_welcome(row["channel_id"])
+            db.update_welcome_reminded(row["channel_id"], now.isoformat())
 
     @check_welcome_channels.before_loop
     async def before_check(self):

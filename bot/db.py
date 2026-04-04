@@ -96,6 +96,10 @@ def init_db() -> None:
             if col not in existing:
                 c.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
 
+        wc_cols = {row[1] for row in c.execute("PRAGMA table_info(welcome_channels)")}
+        if "last_reminded_at" not in wc_cols:
+            c.execute("ALTER TABLE welcome_channels ADD COLUMN last_reminded_at TEXT")
+
 
 # ── guild_config ──────────────────────────────────────────────────────────────
 
@@ -334,6 +338,26 @@ def get_expired_welcomes(before_iso: str) -> list[dict]:
             "SELECT * FROM welcome_channels WHERE created_at <= ?", (before_iso,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_welcomes_to_remind(cutoff_iso: str) -> list[dict]:
+    """Return welcome rows whose last reminder (or join date) is at or before cutoff_iso."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM welcome_channels "
+            "WHERE created_at <= ? "
+            "AND (last_reminded_at IS NULL OR last_reminded_at <= ?)",
+            (cutoff_iso, cutoff_iso),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_welcome_reminded(channel_id: int, reminded_at: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE welcome_channels SET last_reminded_at=? WHERE channel_id=?",
+            (reminded_at, channel_id),
+        )
 
 
 # ── role_requests ─────────────────────────────────────────────────────────────
