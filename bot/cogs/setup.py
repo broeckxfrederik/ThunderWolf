@@ -352,6 +352,7 @@ class Setup(commands.Cog):
                 embed_links=True,
                 use_external_emojis=True,
                 use_external_stickers=True,
+                use_application_commands=True,
                 connect=True,
                 speak=True,
             )
