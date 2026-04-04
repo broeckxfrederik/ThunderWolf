@@ -331,7 +331,7 @@ class Setup(commands.Cog):
             )
             return
 
-        # Grant view_channel to each welcome role
+        # Grant view_channel + read/write access to each welcome role
         updated = []
         missing = []
         for cfg_key, fallback in _WELCOME_ROLES:
@@ -340,11 +340,16 @@ class Setup(commands.Cog):
                 missing.append(fallback)
                 continue
             perms = role.permissions
-            perms.update(view_channel=True)
+            perms.update(
+                view_channel=True,
+                read_messages=True,
+                read_message_history=True,
+                send_messages=True,
+            )
             try:
                 await role.edit(
                     permissions=perms,
-                    reason="setup-lock-channels: grant view_channel",
+                    reason="setup-lock-channels: grant read/write access",
                 )
                 updated.append(role.name)
             except discord.Forbidden:
@@ -352,8 +357,8 @@ class Setup(commands.Cog):
 
         parts = [
             "🔒 **Server lockdown applied.**",
-            f"@everyone can no longer see channels.",
-            f"✅ Granted visibility to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
+            "@everyone can no longer see channels.",
+            f"✅ Granted read/write access to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
         ]
         if missing:
             parts.append(
