@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+from utils import resolve_role as _resolve_role
 from config import (
     ROLE_DRIVER, ROLE_ENGINEER, ROLE_LIVERY, ROLE_VISITOR, ROLE_UPDATES,
     ROLE_CEO, ROLE_TEAM_MANAGER,
@@ -24,6 +25,15 @@ from config import (
     CFG_CAT_WELCOME, CFG_CAT_RACES,
     CFG_CH_ROLE_REQ, CFG_CH_ROLE_APPROVALS, CFG_CH_LINEUP,
 )
+
+# All 5 welcome roles (cfg_key, fallback_name)
+_WELCOME_ROLES = [
+    (CFG_ROLE_DRIVER,   ROLE_DRIVER),
+    (CFG_ROLE_ENGINEER, ROLE_ENGINEER),
+    (CFG_ROLE_LIVERY,   ROLE_LIVERY),
+    (CFG_ROLE_VISITOR,  ROLE_VISITOR),
+    (CFG_ROLE_UPDATES,  ROLE_UPDATES),
+]
 
 
 # ── wizard step definitions ────────────────────────────────────────────────────
@@ -241,6 +251,118 @@ class Setup(commands.Cog):
             )
         else:
             raise error
+
+    @app_commands.command(
+        name="setup-assign-drivers",
+        description="(CEO / server owner) Assign the Driver role to all members who have no welcome role.",
+    )
+    async def setup_assign_drivers(self, interaction: discord.Interaction):
+        if not _is_ceo_or_owner(interaction):
+            await interaction.response.send_message(
+                "❌ Only the CEO or server owner can run this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        driver_role = _resolve_role(guild, CFG_ROLE_DRIVER, ROLE_DRIVER)
+        if driver_role is None:
+            await interaction.followup.send(
+                "❌ Driver role not found. Run `/setup` first to link it.", ephemeral=True
+            )
+            return
+
+        # Resolve all 5 welcome roles so we can check membership
+        welcome_roles = [
+            r for _, fallback in _WELCOME_ROLES
+            if (r := _resolve_role(guild, _, fallback)) is not None
+        ]
+
+        assigned = 0
+        skipped  = 0
+        errors   = 0
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            has_welcome_role = any(r in member.roles for r in welcome_roles)
+            if has_welcome_role:
+                skipped += 1
+                continue
+            try:
+                await member.add_roles(driver_role, reason="setup-assign-drivers: no welcome role")
+                assigned += 1
+            except discord.Forbidden:
+                errors += 1
+
+        parts = [f"✅ Assigned **Driver** role to **{assigned}** member(s)."]
+        if skipped:
+            parts.append(f"{skipped} already had a welcome role and were skipped.")
+        if errors:
+            parts.append(f"⚠️ {errors} member(s) could not be assigned (role hierarchy issue?).")
+        await interaction.followup.send(" ".join(parts), ephemeral=True)
+
+    @app_commands.command(
+        name="setup-lock-channels",
+        description="(CEO / server owner) Make all channels invisible without a welcome role.",
+    )
+    async def setup_lock_channels(self, interaction: discord.Interaction):
+        if not _is_ceo_or_owner(interaction):
+            await interaction.response.send_message(
+                "❌ Only the CEO or server owner can run this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        # Deny view_channel for @everyone
+        everyone_perms = guild.default_role.permissions
+        everyone_perms.update(view_channel=False)
+        try:
+            await guild.default_role.edit(
+                permissions=everyone_perms,
+                reason="setup-lock-channels: deny view_channel for @everyone",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Missing permission to edit the @everyone role.", ephemeral=True
+            )
+            return
+
+        # Grant view_channel to each welcome role
+        updated = []
+        missing = []
+        for cfg_key, fallback in _WELCOME_ROLES:
+            role = _resolve_role(guild, cfg_key, fallback)
+            if role is None:
+                missing.append(fallback)
+                continue
+            perms = role.permissions
+            perms.update(view_channel=True)
+            try:
+                await role.edit(
+                    permissions=perms,
+                    reason="setup-lock-channels: grant view_channel",
+                )
+                updated.append(role.name)
+            except discord.Forbidden:
+                missing.append(role.name)
+
+        parts = [
+            "🔒 **Server lockdown applied.**",
+            f"@everyone can no longer see channels.",
+            f"✅ Granted visibility to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
+        ]
+        if missing:
+            parts.append(
+                f"⚠️ Could not update: {', '.join(missing)} — run `/setup` to link them first."
+            )
+        parts.append(
+            "\n_Note: existing channel-level permission overwrites still apply on top of this._"
+        )
+        await interaction.followup.send("\n".join(p for p in parts if p), ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

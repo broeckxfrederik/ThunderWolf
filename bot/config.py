@@ -33,9 +33,9 @@ CHANNEL_LINEUP          = "team-manager-lineups"
 CHANNEL_ROLE_REQUESTS   = "role-requests"
 CHANNEL_ROLE_APPROVALS  = "role-approvals"
 
-# ── Welcome timeout ───────────────────────────────────────────────────────────
-# Hours before a member who hasn't picked a role is kicked
-WELCOME_TIMEOUT_HOURS = 12
+# ── Welcome reminder ──────────────────────────────────────────────────────────
+# Days between reminder messages sent to members who haven't picked a role
+WELCOME_REMINDER_DAYS = 7
 
 # ── Setup wizard config keys (stored in guild_config table) ───────────────────
 # Roles
