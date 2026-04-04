@@ -345,11 +345,20 @@ class Setup(commands.Cog):
                 read_messages=True,
                 read_message_history=True,
                 send_messages=True,
+                send_messages_in_threads=True,
+                create_public_threads=True,
+                add_reactions=True,
+                attach_files=True,
+                embed_links=True,
+                use_external_emojis=True,
+                use_external_stickers=True,
+                connect=True,
+                speak=True,
             )
             try:
                 await role.edit(
                     permissions=perms,
-                    reason="setup-lock-channels: grant read/write access",
+                    reason="setup-lock-channels: grant standard member permissions",
                 )
                 updated.append(role.name)
             except discord.Forbidden:
@@ -358,7 +367,7 @@ class Setup(commands.Cog):
         parts = [
             "🔒 **Server lockdown applied.**",
             "@everyone can no longer see channels.",
-            f"✅ Granted read/write access to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
+            f"✅ Granted standard member permissions to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
         ]
         if missing:
             parts.append(
