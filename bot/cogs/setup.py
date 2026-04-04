@@ -364,18 +364,47 @@ class Setup(commands.Cog):
             except discord.Forbidden:
                 missing.append(role.name)
 
+        # Resolve the welcome roles we successfully updated, for the deny-pass below
+        resolved_welcome_roles = [
+            _resolve_role(guild, cfg_key, fallback)
+            for cfg_key, fallback in _WELCOME_ROLES
+            if _resolve_role(guild, cfg_key, fallback) is not None
+        ]
+
+        # Protect restricted channels: for any channel/category that explicitly denies
+        # @everyone view_channel, also deny each welcome role — unless it already has an
+        # explicit overwrite (meaning it was intentionally granted, e.g. race channels
+        # grant the Driver role directly).
+        everyone = guild.default_role
+        denied_channels = 0
+        for ch in guild.channels:
+            ow = ch.overwrites_for(everyone)
+            if ow.view_channel is not False:
+                continue  # open channel — guild-level role grant is enough
+            for role in resolved_welcome_roles:
+                existing = ch.overwrites_for(role)
+                if existing.view_channel is not None:
+                    continue  # explicit grant or deny already set — leave it alone
+                existing.update(view_channel=False)
+                try:
+                    await ch.set_permissions(
+                        role, overwrite=existing,
+                        reason="setup-lock-channels: protect restricted channel",
+                    )
+                except discord.Forbidden:
+                    pass
+            denied_channels += 1
+
         parts = [
             "🔒 **Server lockdown applied.**",
             "@everyone can no longer see channels.",
             f"✅ Granted standard member permissions to: {', '.join(f'**{r}**' for r in updated)}." if updated else "",
+            f"🔐 Kept {denied_channels} restricted channel(s) hidden from welcome roles." if denied_channels else "",
         ]
         if missing:
             parts.append(
                 f"⚠️ Could not update: {', '.join(missing)} — run `/setup` to link them first."
             )
-        parts.append(
-            "\n_Note: existing channel-level permission overwrites still apply on top of this._"
-        )
         await interaction.followup.send("\n".join(p for p in parts if p), ephemeral=True)
 
 
