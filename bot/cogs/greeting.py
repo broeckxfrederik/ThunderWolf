@@ -34,6 +34,8 @@ from config import (
     CFG_ROLE_DRIVER, CFG_ROLE_ENGINEER, CFG_ROLE_LIVERY,
     CFG_ROLE_VISITOR, CFG_ROLE_UPDATES, CFG_ROLE_CEO, CFG_ROLE_TM,
     CFG_CAT_WELCOME, WELCOME_CATEGORY,
+    CFG_CAT_ADMIN, ADMIN_CATEGORY,
+    CFG_CH_LEAVERS, CHANNEL_LEAVERS,
     WELCOME_REMINDER_DAYS,
 )
 
@@ -73,6 +75,62 @@ async def _get_or_create_welcome_category(guild: discord.Guild) -> discord.Categ
     )
     db.set_config(guild.id, CFG_CAT_WELCOME, str(cat.id))
     return cat
+
+
+async def _get_or_create_leaver_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Return (or create) the #leavers log channel under the Admin category."""
+    raw_id = db.get_config(guild.id, CFG_CH_LEAVERS)
+    if raw_id:
+        ch = guild.get_channel(int(raw_id))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+
+    ceo_role = _resolve_role(guild, CFG_ROLE_CEO, ROLE_CEO)
+
+    # Get or create the Admin category
+    raw_cat = db.get_config(guild.id, CFG_CAT_ADMIN)
+    cat = guild.get_channel(int(raw_cat)) if raw_cat else None
+    if not isinstance(cat, discord.CategoryChannel):
+        cat = discord.utils.get(guild.categories, name=ADMIN_CATEGORY)
+    if cat is None:
+        cat_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        if guild.owner:
+            cat_overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
+        if ceo_role:
+            cat_overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
+        try:
+            cat = await guild.create_category(
+                name=ADMIN_CATEGORY,
+                overwrites=cat_overwrites,
+                reason="Admin category",
+            )
+            db.set_config(guild.id, CFG_CAT_ADMIN, str(cat.id))
+        except discord.Forbidden:
+            return None
+
+    # Create the #leavers channel inside it
+    ch_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if guild.owner:
+        ch_overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
+    if ceo_role:
+        ch_overwrites[ceo_role] = discord.PermissionOverwrite(view_channel=True)
+    try:
+        ch = await guild.create_text_channel(
+            name=CHANNEL_LEAVERS,
+            category=cat,
+            overwrites=ch_overwrites,
+            reason="Leaver log channel",
+        )
+        db.set_config(guild.id, CFG_CH_LEAVERS, str(ch.id))
+        return ch
+    except discord.Forbidden:
+        return None
 
 
 # ── join view ─────────────────────────────────────────────────────────────────
@@ -204,6 +262,40 @@ class Greeting(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         await self._run_welcome(member)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        guild = member.guild
+        now   = datetime.datetime.now(datetime.timezone.utc)
+
+        # Log to #leavers
+        leaver_ch = await _get_or_create_leaver_channel(guild)
+        if leaver_ch:
+            roles = [r.name for r in member.roles if r != guild.default_role]
+            role_str = ", ".join(roles) if roles else "no roles"
+            joined_str = (
+                discord.utils.format_dt(member.joined_at, "F")
+                if member.joined_at else "unknown"
+            )
+            try:
+                await leaver_ch.send(
+                    f"👋 **{member}** (`{member.id}`) left the server.\n"
+                    f"Joined: {joined_str}\n"
+                    f"Roles: {role_str}"
+                )
+            except discord.Forbidden:
+                pass
+
+        # Clean up their welcome channel if it still exists
+        row = db.get_welcome_by_member(guild.id, member.id)
+        if row:
+            ch = guild.get_channel(row["channel_id"])
+            if ch:
+                try:
+                    await ch.delete(reason=f"{member} left the server.")
+                except discord.NotFound:
+                    pass
+            db.remove_welcome(row["channel_id"])
 
     async def _run_welcome(self, member: discord.Member):
         guild    = member.guild

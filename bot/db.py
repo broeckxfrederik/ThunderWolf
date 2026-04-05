@@ -332,6 +332,15 @@ def remove_welcome(channel_id: int) -> None:
         c.execute("DELETE FROM welcome_channels WHERE channel_id=?", (channel_id,))
 
 
+def get_welcome_by_member(guild_id: int, member_id: int) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM welcome_channels WHERE guild_id=? AND member_id=?",
+            (guild_id, member_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_expired_welcomes(before_iso: str) -> list[dict]:
     with _conn() as c:
         rows = c.execute(
